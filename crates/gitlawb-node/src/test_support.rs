@@ -1809,8 +1809,10 @@ mod tests {
 
     /// Seed a SHA-256 source repo (public/a.txt + secret/b.txt), bare-clone it
     /// into each `/tmp/<slug>/<name>.git` path, and return guards + oids.
-    /// SHA-256 object format is required: `get_by_cid` resolves a CID whose
-    /// multihash digest IS the git object id, which only matches in sha256 repos.
+    /// SHA-256 object format matches production (`--object-format=sha256`) so the
+    /// oids are 64-hex. A real CID digests the raw object CONTENT (not the git
+    /// oid), so tests build the request CID with `pin_cid_for` — mirroring the pin
+    /// path — and `get_by_cid` maps it back to the oid via `pinned_cids` (#173).
     struct CidFixture {
         _guards: Vec<std::path::PathBuf>,
         secret_oid: String,
@@ -1903,13 +1905,23 @@ mod tests {
         }
     }
 
-    /// CID whose sha2-256 multihash digest equals the given 64-hex git oid, so
-    /// `get_by_cid` decodes it back to that oid and `git cat-file`s it.
-    fn cid_for_oid(oid_hex: &str) -> String {
-        use gitlawb_core::cid::Cid;
-        let bytes = hex::decode(oid_hex).expect("hex oid");
-        let arr: [u8; 32] = bytes.as_slice().try_into().expect("32-byte sha256 oid");
-        Cid::from_sha256_bytes(&arr).to_string()
+    /// Record a pin exactly as the production pin path does — read the object's
+    /// raw bytes (`git cat-file <type>`, no framing), CID them with
+    /// `Cid::from_git_object_bytes`, and store the `(oid, cid)` row — then return
+    /// the CID string the node advertises (`gl ipfs list`) and a client sends to
+    /// `GET /ipfs/{cid}`. Building the CID from the oid instead (the old
+    /// `cid_for_oid`) produced an identifier that never occurs in production and
+    /// made the gate assertions vacuous: a real pin CID digests the raw content,
+    /// not the git oid, so `get_by_cid` resolves it through `pinned_cids` (#173).
+    async fn pin_cid_for(bare_repo: &std::path::Path, oid: &str, db: &crate::db::Db) -> String {
+        let (_ty, raw) = crate::git::store::read_object(bare_repo, oid)
+            .expect("read object bytes")
+            .expect("object exists in repo");
+        let cid = gitlawb_core::cid::Cid::from_git_object_bytes(&raw).to_string();
+        db.record_pinned_cid(oid, &cid)
+            .await
+            .expect("record pinned cid");
+        cid
     }
 
     fn cid_router(state: &AppState) -> Router {
@@ -1980,9 +1992,18 @@ mod tests {
         let state = test_state(pool).await;
 
         let fx = seed_cid_repos(&slug, &short, &["withhold"]);
-        let secret_cid = cid_for_oid(&fx.secret_oid);
-        let tree_cid = cid_for_oid(&fx.secret_tree_oid);
-        let public_cid = cid_for_oid(&fx.public_oid);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("withhold.git");
+        // Request CIDs are the production pin CIDs (content-hash), recorded in
+        // pinned_cids so get_by_cid resolves each back to its oid (#173).
+        let secret_cid = pin_cid_for(&bare, &fx.secret_oid, &state.db).await;
+        let tree_cid = pin_cid_for(&bare, &fx.secret_tree_oid, &state.db).await;
+        let public_cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
+        let root_tree_cid = pin_cid_for(&bare, &fx.root_tree_oid, &state.db).await;
+        let public_tree_cid = pin_cid_for(&bare, &fx.public_tree_oid, &state.db).await;
+        let commit_cid = pin_cid_for(&bare, &fx.commit_oid, &state.db).await;
+        let tag_cid = pin_cid_for(&bare, &fx.tag_oid, &state.db).await;
 
         state
             .db
@@ -2106,7 +2127,7 @@ mod tests {
         // Root tree (path "/") stays served to anon who passes the "/" gate.
         let (st, _) = cid_parts(
             cid_router(&state)
-                .oneshot(cid_anon(&cid_for_oid(&fx.root_tree_oid)))
+                .oneshot(cid_anon(&root_tree_cid))
                 .await
                 .unwrap(),
         )
@@ -2116,7 +2137,7 @@ mod tests {
         // /public subtree tree stays served to anon (allowed path).
         let (st, _) = cid_parts(
             cid_router(&state)
-                .oneshot(cid_anon(&cid_for_oid(&fx.public_tree_oid)))
+                .oneshot(cid_anon(&public_tree_cid))
                 .await
                 .unwrap(),
         )
@@ -2126,7 +2147,7 @@ mod tests {
         // Commit and annotated tag objects stay served (unchanged by #135).
         let (st, _) = cid_parts(
             cid_router(&state)
-                .oneshot(cid_anon(&cid_for_oid(&fx.commit_oid)))
+                .oneshot(cid_anon(&commit_cid))
                 .await
                 .unwrap(),
         )
@@ -2134,7 +2155,7 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "commit object stays served");
         let (st, _) = cid_parts(
             cid_router(&state)
-                .oneshot(cid_anon(&cid_for_oid(&fx.tag_oid)))
+                .oneshot(cid_anon(&tag_cid))
                 .await
                 .unwrap(),
         )
@@ -2151,8 +2172,11 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "public blob stays served");
 
-        // R5: a genuine unknown CID also 404, uniform with the withheld 404.
-        let absent_cid = cid_for_oid(&"ab".repeat(32));
+        // R5: a genuine unknown CID also 404, uniform with the withheld 404. A
+        // well-formed pin-style CID that was never recorded in pinned_cids, so the
+        // oid_for_cid resolve misses (the production not-found path).
+        let absent_cid =
+            gitlawb_core::cid::Cid::from_git_object_bytes(b"never pinned to this node").to_string();
         let (st, _) = cid_parts(
             cid_router(&state)
                 .oneshot(cid_anon(&absent_cid))
@@ -2192,7 +2216,11 @@ mod tests {
         let state = test_state(pool).await;
 
         let fx = seed_cid_repos(&slug, &short, &["withhold", "pubcopy"]);
-        let secret_cid = cid_for_oid(&fx.secret_oid);
+        // Same content in both clones -> same oid/CID; read from either.
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("withhold.git");
+        let secret_cid = pin_cid_for(&bare, &fx.secret_oid, &state.db).await;
 
         // Withholding repo, iterated FIRST (later updated_at; list_all_repos is DESC).
         let mut withhold = seed_repo(&owner_did, "withhold");
@@ -2253,7 +2281,10 @@ mod tests {
         let state = test_state(pool).await;
 
         let fx = seed_cid_repos(&slug, &short, &["priv"]);
-        let blob_cid = cid_for_oid(&fx.public_oid);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("priv.git");
+        let blob_cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
 
         let mut rec = seed_repo(&owner_did, "priv");
         rec.is_public = false;
@@ -2309,15 +2340,17 @@ mod tests {
         let state = test_state(pool).await;
 
         let fx = seed_cid_repos(&slug, &short, &["withhold"]);
-        let secret_cid = cid_for_oid(&fx.secret_oid);
-        let public_cid = cid_for_oid(&fx.public_oid);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("withhold.git");
+        // Recorded pins so get_by_cid resolves each CID to its oid and reaches the
+        // walk; the 404s below are then the fail-closed skip, not a table miss.
+        let secret_cid = pin_cid_for(&bare, &fx.secret_oid, &state.db).await;
+        let public_cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
 
         // Force the withheld walk to fail closed: a ref pointing at a blob (not
         // tree-ish) makes `git ls-tree -r` error, which `withheld_blob_oids`
         // propagates as Err → the handler's `Ok(Err)` arm skips the repo.
-        let bare = std::path::PathBuf::from("/tmp")
-            .join(&slug)
-            .join("withhold.git");
         std::fs::write(
             bare.join("refs/heads/blobref"),
             format!("{}\n", fx.secret_oid),
@@ -2431,7 +2464,9 @@ mod tests {
             64,
             "expected sha256 oid: {dangling_oid}"
         );
-        let dangling_cid = cid_for_oid(&dangling_oid);
+        // Record the pin so oid_for_cid resolves it — the 404 must then come from
+        // the allowed-set gate excluding the dangling oid, not from a table miss.
+        let dangling_cid = pin_cid_for(&bare, &dangling_oid, &state.db).await;
 
         state
             .db
@@ -2536,7 +2571,9 @@ mod tests {
         );
         let dangling_tree_oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
         assert_eq!(dangling_tree_oid.len(), 64, "expected sha256 oid");
-        let dangling_cid = cid_for_oid(&dangling_tree_oid);
+        // Record the pin so the 404 is the allowed-tree-set gate excluding the
+        // dangling tree, not a table miss.
+        let dangling_cid = pin_cid_for(&bare, &dangling_tree_oid, &state.db).await;
 
         state
             .db
@@ -2579,7 +2616,10 @@ mod tests {
         let state = test_state(pool).await;
 
         let fx = seed_cid_repos(&slug, &short, &["nopathrule"]);
-        let tree_cid = cid_for_oid(&fx.secret_tree_oid);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("nopathrule.git");
+        let tree_cid = pin_cid_for(&bare, &fx.secret_tree_oid, &state.db).await;
 
         // Public repo, no visibility rules → has_path_scoped_rule is false.
         state

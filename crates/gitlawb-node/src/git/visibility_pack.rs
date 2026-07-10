@@ -384,27 +384,56 @@ pub fn allowed_blob_set_for_caller(
 
 /// Root tree oid of every reachable commit, at "/". `ls-tree` never emits a commit's
 /// own root tree (it lists entries *under* a tree), so it is added explicitly here.
-/// Resolved in ONE `git log --no-walk --format=%T` pass over the shared commit set —
-/// not a per-commit `rev-parse` — so a tree-set walk costs the same subprocess order
-/// as the blob walk. A commit whose root tree git cannot resolve fails the pass
-/// (bail), failing closed.
+/// Resolved in ONE `git log --no-walk --format=%T --stdin` pass over the shared commit
+/// set — not a per-commit `rev-parse` — so a tree-set walk costs the same subprocess
+/// order as the blob walk. The commit oids go on STDIN, not argv: a long history has
+/// tens of thousands of reachable commits, and passing them all as arguments overflows
+/// ARG_MAX so `git log` fails to spawn — which the caller treats as a walk error and
+/// fail-closed 404s an authorized reader of a reachable/root tree (#173 P2). A commit
+/// whose root tree git cannot resolve fails the pass (bail), failing closed.
 fn root_tree_pairs(repo_path: &Path, commits: &[String]) -> Result<HashSet<(String, String)>> {
     if commits.is_empty() {
         return Ok(HashSet::new());
     }
-    let mut args: Vec<&str> = vec!["log", "--no-walk=unsorted", "--format=%T"];
-    args.extend(commits.iter().map(String::as_str));
-    let out = std::process::Command::new("git")
-        .args(&args)
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .args(["log", "--no-walk=unsorted", "--format=%T", "--stdin"])
         .current_dir(repo_path)
-        .output()
-        .context("git log --no-walk --format=%T failed")?;
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn git log --no-walk --format=%T --stdin")?;
+    // Write the oids from a separate thread while this one drains stdout: on a long
+    // history the output is large, and a single thread that writes all of stdin before
+    // reading stdout would deadlock once git's stdout pipe fills.
+    let mut stdin = child.stdin.take().context("git log stdin unavailable")?;
+    let commits_owned = commits.to_vec();
+    let writer = std::thread::spawn(move || -> std::io::Result<()> {
+        let mut buf = String::with_capacity(commits_owned.len() * 65);
+        for c in &commits_owned {
+            buf.push_str(c);
+            buf.push('\n');
+        }
+        stdin.write_all(buf.as_bytes())
+        // stdin dropped here → git sees EOF on its revision list
+    });
+    let out = child
+        .wait_with_output()
+        .context("git log --no-walk --format=%T --stdin failed")?;
+    let write_res = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("git log stdin writer thread panicked"))?;
     if !out.status.success() {
+        // git's own error is the more informative signal than a BrokenPipe from the
+        // writer (which just means git exited before reading every oid), so check it
+        // first and fail closed.
         anyhow::bail!(
-            "git log --no-walk --format=%T failed: {}",
+            "git log --no-walk --format=%T --stdin failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
+    write_res.context("writing commit oids to git log stdin")?;
     let mut set = HashSet::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let oid = line.trim();
@@ -1006,6 +1035,79 @@ mod tests {
             set.contains(&root1) && set.contains(&root2),
             "root trees of BOTH reachable commits are in the set (batched root pass)"
         );
+    }
+
+    #[test]
+    fn root_tree_pairs_over_many_commits_does_not_deadlock() {
+        // Scale guard for the #173 P2 fix: root_tree_pairs feeds every reachable
+        // commit oid to `git log --stdin` on STDIN and drains stdout from a separate
+        // thread. The 2-commit test above (~130 bytes each way) cannot reach the
+        // large-bidirectional-IO path; here N commits push ~N*41 bytes of oids in
+        // and ~N*41 bytes of %T out, exceeding the ~64 KiB pipe buffer in BOTH
+        // directions. A regression that writes all of stdin before draining stdout
+        // hangs; recv_timeout turns that into a failure instead of hanging the suite.
+        // It also confirms parity at scale — every distinct root tree is returned.
+        // (Mirrors many_long_named_unresolvable_refs_do_not_deadlock.)
+        const N: usize = 2500;
+        let td = TempDir::new().unwrap();
+        let bare = td.path().join("many.git");
+        assert!(Command::new("git")
+            .args(["init", "-q", "--bare", bare.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+
+        // fast-import a linear chain of N commits, each adding a distinct file so
+        // every root tree is distinct (dedup cannot shrink the output). One
+        // subprocess, ~1s — far cheaper than N `git commit` spawns.
+        let mut stream = String::new();
+        for i in 0..N {
+            let (b, cm) = (2 * i + 1, 2 * i + 2);
+            let content = format!("v{i}");
+            let msg = format!("c{i}");
+            stream.push_str(&format!(
+                "blob\nmark :{b}\ndata {}\n{content}\n",
+                content.len()
+            ));
+            stream.push_str(&format!(
+                "commit refs/heads/main\nmark :{cm}\ncommitter t <t@t> 0 +0000\ndata {}\n{msg}\n",
+                msg.len()
+            ));
+            if i > 0 {
+                stream.push_str(&format!("from :{}\n", 2 * (i - 1) + 2));
+            }
+            stream.push_str(&format!("M 100644 :{b} f{i}\n\n"));
+        }
+        let mut fi = Command::new("git")
+            .args(["fast-import", "--quiet"])
+            .current_dir(&bare)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            fi.stdin
+                .take()
+                .unwrap()
+                .write_all(stream.as_bytes())
+                .unwrap();
+        }
+        assert!(fi.wait().unwrap().success(), "fast-import failed");
+
+        let commits = reachable_commits(&bare).unwrap();
+        assert_eq!(commits.len(), N, "all {N} commits reachable");
+
+        // Call root_tree_pairs directly (private, same module) under a watchdog —
+        // this is the exact stdin-oids / stdout-%T surface the fix protects.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(root_tree_pairs(&bare, &commits).map(|s| s.len()));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Ok(len)) => assert_eq!(len, N, "every distinct root tree returned"),
+            Ok(Err(e)) => panic!("root_tree_pairs errored: {e}"),
+            Err(_) => panic!("root_tree_pairs did not return within 30s (stdin/stdout deadlock?)"),
+        }
     }
 
     #[test]

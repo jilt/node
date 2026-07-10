@@ -1,14 +1,17 @@
 //! GET /ipfs/{cid} — content-addressed retrieval of git objects by CIDv1.
 //!
-//! Every git object stored on this node is addressable by its IPFS CIDv1.
+//! Every git object pinned on this node is addressable by its IPFS CIDv1.
 //! The CID is computed as:
 //!
 //!   CIDv1(codec=raw, multihash=sha2-256(content_bytes))
 //!
 //! where `content_bytes` is the raw object content as returned by
-//! `git cat-file <type> <sha256>` (i.e. without the git framing header).
-//! This is consistent with how `gitlawb_core::cid::Cid::from_git_object_bytes`
-//! computes CIDs when objects are pushed.
+//! `git cat-file <type> <sha256>` (i.e. without the git framing header) — the
+//! same bytes `gitlawb_core::cid::Cid::from_git_object_bytes` hashes when the
+//! object is pinned. That digest is NOT the object's git oid: git frames the
+//! content with a `"<type> <len>\0"` header before hashing, so `sha2-256(content)`
+//! and the git oid differ. The handler therefore maps the CID back to its oid via
+//! the `pinned_cids` table rather than treating the digest as an oid (#173).
 //!
 //! Serving is access-controlled: an object is returned only from a repo row the
 //! requesting caller is permitted to read (per-caller path-scoped visibility,
@@ -35,8 +38,9 @@ use crate::visibility::{visibility_check, Decision};
 
 /// GET /ipfs/{cid}
 ///
-/// Search all repos on the node for a git object whose SHA-256 hash matches
-/// the given CIDv1, returning its raw content if the caller may read it.
+/// Resolve the CIDv1 to its git oid via the `pinned_cids` table, then search all
+/// repos on the node for that object, returning its raw content if the caller may
+/// read it.
 ///
 /// Visibility (#110, #126): the object is served only from a repo row the
 /// caller passes. For each iterated row we gate against that row's OWN rules
@@ -63,7 +67,8 @@ pub async fn get_by_cid(
     State(state): State<AppState>,
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
-    // 1. Decode the CID and extract the SHA-256 digest
+    // 1. Decode and validate the CID (uniform 400 on a malformed / non-sha2-256
+    //    CID, before any DB or git work).
     let cid = CidGeneric::<64>::from_str(&cid_str)
         .map_err(|e| AppError::BadRequest(format!("invalid CID: {e}")))?;
 
@@ -76,7 +81,25 @@ pub async fn get_by_cid(
         ));
     }
 
-    let sha256_hex = hex::encode(mh.digest());
+    // Resolve the content-addressed CID to the object's git oid. A real pin CID
+    // digests the raw object content (`Cid::from_git_object_bytes`), NOT the git
+    // oid (git frames content with a `"<type> <len>\0"` header first), so we map
+    // it back through `pinned_cids` rather than treating the digest as an oid
+    // (#173). A CID never pinned here is an opaque 404, uniform with a genuine
+    // not-found and a visibility denial.
+    let sha256_hex = match state
+        .db
+        .oid_for_cid(&cid_str)
+        .await
+        .map_err(AppError::Internal)?
+    {
+        Some(oid) => oid,
+        None => {
+            return Err(AppError::RepoNotFound(format!(
+                "no git object found for CID {cid_str}"
+            )))
+        }
+    };
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     let caller_owned = caller.map(|c| c.to_string());
 

@@ -532,6 +532,12 @@ const MIGRATIONS: &[Migration] = &[
             )"#,
             // Migrate existing installs that lack the pinata_cid column
             "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS pinata_cid TEXT",
+            // GET /ipfs/{cid} resolves an incoming CID -> git oid via this column
+            // (#173); index it so the lookup is not a per-request table scan.
+            // Non-unique on purpose: cid is a function of raw content, so a UNIQUE
+            // index could reject a legitimate record_pinned_cid insert, and any
+            // colliding rows would serve byte-identical content anyway.
+            "CREATE INDEX IF NOT EXISTS idx_pinned_cids_cid ON pinned_cids(cid)",
             r#"CREATE TABLE IF NOT EXISTS branch_cids (
                 repo       TEXT NOT NULL,
                 ref_name   TEXT NOT NULL,
@@ -2164,6 +2170,19 @@ impl Db {
             .fetch_one(&self.pool)
             .await?;
         Ok(row.get::<i64, _>("cnt") > 0)
+    }
+
+    /// The git oid a pinned CID maps to (`pinned_cids.cid` -> `sha256_hex`).
+    /// `GET /ipfs/{cid}` resolves the content-addressed CID a client sends back to
+    /// the object's git oid this way: a real pin CID digests the raw object
+    /// content, not the git oid, so the digest cannot be `git cat-file`d directly
+    /// (#173). `None` when the CID was never pinned on this node.
+    pub async fn oid_for_cid(&self, cid: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT sha256_hex FROM pinned_cids WHERE cid = $1 LIMIT 1")
+            .bind(cid)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>("sha256_hex")))
     }
 
     pub async fn record_pinned_cid(&self, sha256_hex: &str, cid: &str) -> Result<()> {
