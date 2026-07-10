@@ -2488,6 +2488,124 @@ mod tests {
         assert!(!body.contains("DANGLING SECRET"));
     }
 
+    /// #135: a DANGLING tree (in the ODB, referenced by no commit) 404s under
+    /// path-scoped rules for anon AND owner — the reachable-only allowed-tree-set
+    /// never enumerates it. Handler-level companion to the helper test
+    /// `allowed_tree_set_excludes_dangling_tree`, proving the `get_by_cid` tree arm
+    /// (memo insert + `!in_allowed` continue) fails closed on the dangling case.
+    #[sqlx::test]
+    async fn ipfs_cid_dangling_tree_fails_closed_under_path_rules(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["dangtree"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("dangtree.git");
+
+        // Dangling tree via `git mktree`: a UNIQUE entry name so its oid is
+        // content-distinct from every reachable tree (a content-identical tree would
+        // dedup to a reachable oid — that is T2, not danglingness).
+        let mut child = std::process::Command::new("git")
+            .args(["mktree"])
+            .current_dir(&bare)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn git mktree");
+        {
+            use std::io::Write;
+            writeln!(
+                child.stdin.as_mut().unwrap(),
+                "100644 blob {}\tdangling-only-unreferenced.txt",
+                fx.secret_oid
+            )
+            .unwrap();
+        }
+        let out = child.wait_with_output().expect("mktree output");
+        assert!(
+            out.status.success(),
+            "git mktree: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let dangling_tree_oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(dangling_tree_oid.len(), 64, "expected sha256 oid");
+        let dangling_cid = cid_for_oid(&dangling_tree_oid);
+
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "dangtree"))
+            .await
+            .expect("seed repo");
+        let rec = state
+            .db
+            .get_repo(&owner_did, "dangtree")
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .db
+            .set_visibility_rule(&rec.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
+            .await
+            .expect("deny rule");
+
+        for req in [cid_anon(&dangling_cid), cid_signed(&owner, &dangling_cid)] {
+            let (st, _) = cid_parts(cid_router(&state).oneshot(req).await.unwrap()).await;
+            assert_eq!(
+                st,
+                StatusCode::NOT_FOUND,
+                "dangling tree must 404 under path-scoped rules (anon + owner)"
+            );
+        }
+    }
+
+    /// #135: with NO path-scoped rule the per-object gate is skipped, so a tree CID
+    /// is served (the `"/"` gate is the whole story). Guards against over-gating
+    /// trees — the tree analog of the blob skip-walk branch.
+    #[sqlx::test]
+    async fn ipfs_cid_tree_served_when_no_path_scoped_rule(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["nopathrule"]);
+        let tree_cid = cid_for_oid(&fx.secret_tree_oid);
+
+        // Public repo, no visibility rules → has_path_scoped_rule is false.
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "nopathrule"))
+            .await
+            .expect("seed repo");
+
+        let (st, body) = cid_bytes(
+            cid_router(&state)
+                .oneshot(cid_anon(&tree_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "tree served to anon when no path-scoped rule exists"
+        );
+        assert!(
+            bytes_contain(&body, b"b.txt"),
+            "served tree carries its child structure"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Issue #120 — repo-scoped read surfaces visibility gate
     // ---------------------------------------------------------------------------

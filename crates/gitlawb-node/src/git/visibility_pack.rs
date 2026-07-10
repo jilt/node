@@ -892,9 +892,9 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        write!(
+        writeln!(
             child.stdin.as_mut().unwrap(),
-            "100644 blob {secret_oid}\tdangling-only-unreferenced.txt\n"
+            "100644 blob {secret_oid}\tdangling-only-unreferenced.txt"
         )
         .unwrap();
         let out = child.wait_with_output().unwrap();
@@ -909,6 +909,103 @@ mod tests {
                 "dangling tree must never be in the reachable allowed-set (caller={caller:?})"
             );
         }
+    }
+
+    #[test]
+    fn allowed_tree_set_includes_tree_shared_across_allowed_and_denied_paths() {
+        // T2 (content-dedup): the SAME tree oid reachable at both an allowed and a
+        // withheld path is INCLUDED for anon (allowed-wins) — its structure is
+        // visible to the caller at the allowed path. Mirrors the blob analog
+        // `same_blob_at_allowed_and_denied_path_is_not_withheld`.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        std::fs::create_dir_all(work.join("pub/sub")).unwrap();
+        std::fs::create_dir_all(work.join("sec/sub")).unwrap();
+        std::fs::write(work.join("pub/sub/f.txt"), b"same bytes\n").unwrap();
+        std::fs::write(work.join("sec/sub/f.txt"), b"same bytes\n").unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&work)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["add", "."]);
+        run(&["commit", "-qm", "seed"]);
+        let oid = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let pub_sub = oid("HEAD:pub/sub");
+        let sec_sub = oid("HEAD:sec/sub");
+        assert_eq!(pub_sub, sec_sub, "identical content dedups to one tree oid");
+
+        // Withhold /sec from anon; the shared oid is still reachable at /pub/sub.
+        let rules = [rule("/sec/**", &[])];
+        let anon = allowed_tree_set_for_caller(&work, &rules, true, OWNER, None).unwrap();
+        assert!(
+            anon.contains(&pub_sub),
+            "a tree reachable at an allowed path is included even when also at a withheld path"
+        );
+    }
+
+    #[test]
+    fn allowed_tree_set_includes_root_trees_of_all_reachable_commits() {
+        // The batched root-tree pass (root_tree_pairs) must return EVERY reachable
+        // commit's root tree, not just HEAD's — two commits with distinct root trees
+        // both land in the set. Guards the git-log-over-N-commits root derivation.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&work)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        let oid = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::write(work.join("a.txt"), b"one\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "c1"]);
+        let root1 = oid("HEAD^{tree}");
+        std::fs::write(work.join("b.txt"), b"two\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "c2"]);
+        let root2 = oid("HEAD^{tree}");
+        assert_ne!(root1, root2, "the two commits have distinct root trees");
+
+        // Public repo, no rules: every reachable tree is allowed for anon.
+        let set = allowed_tree_set_for_caller(&work, &[], true, OWNER, None).unwrap();
+        assert!(
+            set.contains(&root1) && set.contains(&root2),
+            "root trees of BOTH reachable commits are in the set (batched root pass)"
+        );
     }
 
     #[test]
