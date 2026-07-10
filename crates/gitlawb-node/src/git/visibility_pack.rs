@@ -125,35 +125,31 @@ fn assert_all_refs_are_commits(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// List every (blob_oid, "/repo/relative/path") pair reachable from any commit in
-/// `repo_path` — every ref *and* every historical commit those refs reach, not just
-/// the ref tips. `git upload-pack` (serve) and the whole-repo pin fallback
-/// (`git cat-file --batch-all-objects`) expose the full reachable object graph,
-/// including a blob that only ever existed
-/// in an older commit (a since-deleted file, a rotated secret whose previous version
-/// is still in history). Classifying only ref-tip trees would leave those blobs
-/// unwithheld while pin/serve still hand them out in cleartext, so we enumerate all
-/// reachable commits and walk each commit's tree.
+/// Every `(oid, "/repo/relative/path", kind)` triple reachable from any commit in
+/// `repo_path` — the single walk seam that `blob_paths` (`kind == "blob"`) and
+/// `tree_paths` (`kind == "tree"`) both filter, so the blob and tree visibility
+/// gates cannot drift. One `git ls-tree -rzt` per reachable commit: `-rzt` is
+/// byte-identical to `-rz` for blob records and additionally emits the tree object
+/// for each directory at its own path. `kind` is git's object-type string
+/// ("blob", "tree", or "commit" for a gitlink). The commit's ROOT tree is not
+/// emitted by `ls-tree` (it lists entries *under* a tree); `tree_paths` adds it.
 ///
-/// `--all` covers every ref namespace (a blob reachable only through `refs/notes/*`
-/// must not escape withholding); HEAD is added explicitly for the detached case,
-/// where HEAD reaches commits that no ref does. `git ls-tree -rz <commit>` per commit
-/// keeps every path a blob lives at (the same blob content can appear at several
-/// paths, and the per-path visibility check needs all of them). This is why it is
-/// not `git rev-list --objects`, which reports only one path per object. Pairs are
-/// de-duplicated across commits. Paths carry a leading "/" to match the glob form
-/// used by visibility rules ("/secret/**").
+/// Enumerates every reachable commit, not just ref tips: `git upload-pack` (serve)
+/// and the whole-repo pin fallback (`git cat-file --batch-all-objects`) expose the
+/// full reachable object graph, including a blob or tree that only ever existed in
+/// an older commit. `--all` covers every ref namespace (`refs/notes/*` included);
+/// HEAD is added explicitly for the detached case, where HEAD reaches commits no
+/// ref does. When HEAD does not resolve (unborn branch on an empty repo) `--all`
+/// alone yields nothing, which is correct. Triples are de-duplicated across commits
+/// and paths carry a leading "/" to match the glob form of visibility rules
+/// ("/secret/**").
 ///
-/// Fails closed: if commit enumeration or any tree walk fails, returns an error so
-/// the caller aborts the serve/pin rather than producing a partial (under-withheld)
-/// set.
-fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
+/// Fails closed: if commit enumeration or any tree walk fails — or a path is not
+/// valid UTF-8 — it returns an error so the caller aborts the serve/pin rather than
+/// producing a partial (under-withheld) set.
+fn object_paths(repo_path: &Path) -> Result<HashSet<(String, String, String)>> {
     assert_all_refs_are_commits(repo_path)?;
 
-    // Enumerate every reachable commit, not just ref tips. `--all` walks all refs;
-    // append HEAD so a detached HEAD (reachable by rev-list/upload-pack but in no
-    // ref) is still classified. When HEAD does not resolve (unborn branch on an
-    // empty repo) `--all` alone yields nothing, which is correct — no objects exist.
     let head = store::head_commit(repo_path).context("resolve HEAD failed")?;
     let mut rev_args = vec!["rev-list", "--all"];
     if head.is_some() {
@@ -171,27 +167,27 @@ fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
         );
     }
     let commits_stdout = String::from_utf8_lossy(&commits.stdout);
-    let mut out: HashSet<(String, String)> = HashSet::new();
+    let mut out: HashSet<(String, String, String)> = HashSet::new();
     for commit in commits_stdout.lines() {
         let commit = commit.trim();
         if commit.is_empty() {
             continue;
         }
         let listing = std::process::Command::new("git")
-            .args(["ls-tree", "-rz", commit])
+            .args(["ls-tree", "-rzt", commit])
             .current_dir(repo_path)
             .output()
-            .context("git ls-tree -rz failed")?;
+            .context("git ls-tree -rzt failed")?;
         if !listing.status.success() {
             anyhow::bail!(
-                "git ls-tree -rz {commit} failed: {}",
+                "git ls-tree -rzt {commit} failed: {}",
                 String::from_utf8_lossy(&listing.stderr)
             );
         }
         // `-z` NUL-delimits records and emits paths raw; plain `git ls-tree -r`
         // C-quotes any path with non-ASCII or special bytes (e.g. café.txt becomes
         // "secret/caf\303\251.txt"), and that quoted literal would not match a
-        // visibility rule like "/secret/**", under-withholding the blob. The TAB
+        // visibility rule like "/secret/**", under-withholding the object. The TAB
         // field separator survives `-z`, so the per-record parse is unchanged.
         //
         // Parse strictly: a lossy decode would replace an invalid byte in a denied
@@ -200,12 +196,12 @@ fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
         // layer down. Fail closed instead so the caller aborts rather than leaks.
         let Ok(listing_stdout) = std::str::from_utf8(&listing.stdout) else {
             anyhow::bail!(
-                "git ls-tree -rz {commit} returned a non-UTF-8 path; \
+                "git ls-tree -rzt {commit} returned a non-UTF-8 path; \
                  refusing to produce a partial (under-withheld) set"
             );
         };
         for record in listing_stdout.split('\0') {
-            // "<mode> blob <oid>\t<path>"
+            // "<mode> <kind> <oid>\t<path>"
             let Some((meta, path)) = record.split_once('\t') else {
                 continue;
             };
@@ -213,14 +209,25 @@ fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
             let _mode = parts.next();
             let kind = parts.next();
             let oid = parts.next();
-            if kind == Some("blob") {
-                if let Some(oid) = oid {
-                    out.insert((oid.to_string(), format!("/{path}")));
-                }
+            if let (Some(kind), Some(oid)) = (kind, oid) {
+                out.insert((oid.to_string(), format!("/{path}"), kind.to_string()));
             }
         }
     }
-    Ok(out.into_iter().collect())
+    Ok(out)
+}
+
+/// `(blob_oid, "/path")` pairs reachable from any commit — the `kind == "blob"`
+/// slice of [`object_paths`]. Output is byte-identical to the pre-refactor direct
+/// walk (blobs only, deduped, leading-slash paths), so every caller
+/// (`withheld_blob_oids`, `replicable_blob_set`, `allowed_blob_set_for_caller`) is
+/// unaffected. See [`object_paths`] for the walk and fail-closed semantics.
+fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
+    Ok(object_paths(repo_path)?
+        .into_iter()
+        .filter(|(_, _, kind)| kind == "blob")
+        .map(|(oid, path, _)| (oid, path))
+        .collect())
 }
 
 /// Blob OIDs the caller may not read. A blob is withheld only if visibility
@@ -684,6 +691,39 @@ mod tests {
                 "tree1".to_string(),
                 "b_pub".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn object_paths_emits_trees_and_blob_paths_is_the_blob_slice() {
+        let (_td, bare, secret_oid, public_oid) = fixture();
+        let objs = object_paths(&bare).unwrap();
+
+        // Blob records survive the `-rzt` change, at their paths (unchanged).
+        assert!(objs.contains(&(secret_oid.clone(), "/secret/b.txt".into(), "blob".into())));
+        assert!(objs.contains(&(public_oid.clone(), "/public/a.txt".into(), "blob".into())));
+
+        // The #135 addition: subtree tree objects at their directory paths.
+        assert!(
+            objs.iter().any(|(_, p, k)| k == "tree" && p == "/secret"),
+            "the /secret subtree tree must be emitted at its dir path"
+        );
+        assert!(
+            objs.iter().any(|(_, p, k)| k == "tree" && p == "/public"),
+            "the /public subtree tree must be emitted at its dir path"
+        );
+
+        // blob_paths must equal the blob slice of object_paths exactly — compared as
+        // SETS (both walks dedup via HashSet; the collected order is nondeterministic).
+        let bp: HashSet<(String, String)> = blob_paths(&bare).unwrap().into_iter().collect();
+        let bp_from_obj: HashSet<(String, String)> = objs
+            .iter()
+            .filter(|(_, _, k)| k == "blob")
+            .map(|(o, p, _)| (o.clone(), p.clone()))
+            .collect();
+        assert_eq!(
+            bp, bp_from_obj,
+            "blob_paths output must be byte-identical to object_paths' blob slice"
         );
     }
 
