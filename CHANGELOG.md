@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/Gitlawb/node/compare/v0.5.1...v0.6.0) (2026-07-10)
+
+
+### Features
+
+* **icaptcha-client:** solve the iCaptcha proof-of-work on answer ([#181](https://github.com/Gitlawb/node/issues/181)) ([c98b503](https://github.com/Gitlawb/node/commit/c98b503f90cade54ce9c588bd2373a4e3486f2fc))
+
 ## [0.5.1](https://github.com/Gitlawb/node/compare/v0.5.0...v0.5.1) (2026-07-10)
 
 
