@@ -125,6 +125,35 @@ fn assert_all_refs_are_commits(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Every reachable commit oid: `git rev-list --all` plus HEAD (the detached case,
+/// where HEAD reaches commits no ref does). Empty on an unborn branch. The single
+/// commit-enumeration seam shared by `object_paths` and the root-tree derivation, so
+/// the tree walk and the root-tree inclusion can never disagree on which commits are
+/// reachable. Fails closed on a rev-list error.
+fn reachable_commits(repo_path: &Path) -> Result<Vec<String>> {
+    let head = store::head_commit(repo_path).context("resolve HEAD failed")?;
+    let mut rev_args = vec!["rev-list", "--all"];
+    if head.is_some() {
+        rev_args.push("HEAD");
+    }
+    let out = std::process::Command::new("git")
+        .args(&rev_args)
+        .current_dir(repo_path)
+        .output()
+        .context("git rev-list --all failed")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git rev-list --all failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
 /// Every `(oid, "/repo/relative/path", kind)` triple reachable from any commit in
 /// `repo_path` — the single walk seam that `blob_paths` (`kind == "blob"`) and
 /// `tree_paths` (`kind == "tree"`) both filter, so the blob and tree visibility
@@ -150,31 +179,10 @@ fn assert_all_refs_are_commits(repo_path: &Path) -> Result<()> {
 fn object_paths(repo_path: &Path) -> Result<HashSet<(String, String, String)>> {
     assert_all_refs_are_commits(repo_path)?;
 
-    let head = store::head_commit(repo_path).context("resolve HEAD failed")?;
-    let mut rev_args = vec!["rev-list", "--all"];
-    if head.is_some() {
-        rev_args.push("HEAD");
-    }
-    let commits = std::process::Command::new("git")
-        .args(&rev_args)
-        .current_dir(repo_path)
-        .output()
-        .context("git rev-list --all failed")?;
-    if !commits.status.success() {
-        anyhow::bail!(
-            "git rev-list --all failed: {}",
-            String::from_utf8_lossy(&commits.stderr)
-        );
-    }
-    let commits_stdout = String::from_utf8_lossy(&commits.stdout);
     let mut out: HashSet<(String, String, String)> = HashSet::new();
-    for commit in commits_stdout.lines() {
-        let commit = commit.trim();
-        if commit.is_empty() {
-            continue;
-        }
+    for commit in reachable_commits(repo_path)? {
         let listing = std::process::Command::new("git")
-            .args(["ls-tree", "-rzt", commit])
+            .args(["ls-tree", "-rzt", &commit])
             .current_dir(repo_path)
             .output()
             .context("git ls-tree -rzt failed")?;
@@ -340,6 +348,65 @@ pub fn allowed_blob_set_for_caller(
     caller: Option<&str>,
 ) -> Result<HashSet<String>> {
     let pairs = blob_paths(repo_path)?;
+    let mut allowed = HashSet::new();
+    for (oid, path) in &pairs {
+        if visibility_check(rules, is_public, owner_did, caller, path) == Decision::Allow {
+            allowed.insert(oid.clone());
+        }
+    }
+    Ok(allowed)
+}
+
+/// Every `(tree_oid, "/path")` pair reachable in `repo_path`: the `kind == "tree"`
+/// slice of [`object_paths`] (subtree trees at their directory paths) PLUS every
+/// reachable commit's root tree at "/". `ls-tree` never emits a commit's own root
+/// tree (it lists entries *under* a tree), so the root is added explicitly via
+/// `<commit>^{tree}` over the same [`reachable_commits`] set — without it the root
+/// tree would be wrongly denied. The tree analog of [`blob_paths`].
+fn tree_paths(repo_path: &Path) -> Result<HashSet<(String, String)>> {
+    let mut out: HashSet<(String, String)> = object_paths(repo_path)?
+        .into_iter()
+        .filter(|(_, _, kind)| kind == "tree")
+        .map(|(oid, path, _)| (oid, path))
+        .collect();
+    // Root tree of each reachable commit, at "/". Derived from the same commit set
+    // object_paths walks, so reachability cannot diverge between the two.
+    for commit in reachable_commits(repo_path)? {
+        let resolved = std::process::Command::new("git")
+            .args(["rev-parse", &format!("{commit}^{{tree}}")])
+            .current_dir(repo_path)
+            .output()
+            .context("git rev-parse <commit>^{tree} failed")?;
+        if !resolved.status.success() {
+            anyhow::bail!(
+                "git rev-parse {commit}^{{tree}} failed: {}",
+                String::from_utf8_lossy(&resolved.stderr)
+            );
+        }
+        let oid = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
+        if !oid.is_empty() {
+            out.insert((oid, "/".to_string()));
+        }
+    }
+    Ok(out)
+}
+
+/// Reachable tree OIDs that visibility ALLOWS `caller` at some path — the tree analog
+/// of [`allowed_blob_set_for_caller`]. `GET /ipfs/{cid}` gates tree objects with this
+/// so the CID surface matches `get_tree`: a tree reachable only at a withheld path is
+/// absent from the set and 404'd; the root tree ("/") and any tree on the path to an
+/// allowed subtree are present. Fails closed on a dangling/unreachable tree (never
+/// enumerated by the reachable walk, so never in the set — the #126 geometry, for
+/// trees). A tree reachable at an allowed path is included even when also reachable at
+/// a withheld one (its structure is visible to this caller elsewhere).
+pub fn allowed_tree_set_for_caller(
+    repo_path: &Path,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> Result<HashSet<String>> {
+    let pairs = tree_paths(repo_path)?;
     let mut allowed = HashSet::new();
     for (oid, path) in &pairs {
         if visibility_check(rules, is_public, owner_did, caller, path) == Decision::Allow {
@@ -725,6 +792,80 @@ mod tests {
             bp, bp_from_obj,
             "blob_paths output must be byte-identical to object_paths' blob slice"
         );
+    }
+
+    #[test]
+    fn allowed_tree_set_gates_withheld_subtree_tree() {
+        let (_td, bare, _s, _p) = fixture();
+        let oid = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rev-parse {rev}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let secret_tree = oid("HEAD:secret");
+        let public_tree = oid("HEAD:public");
+        let root_tree = oid("HEAD^{tree}");
+        let reader = "did:key:z6MkReader";
+        let rules = [rule("/secret/**", &[reader])];
+
+        // anon: the withheld /secret tree is excluded; root ("/") and /public are in.
+        let anon = allowed_tree_set_for_caller(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            !anon.contains(&secret_tree),
+            "withheld /secret subtree tree excluded for anon"
+        );
+        assert!(anon.contains(&root_tree), "root tree included (path /)");
+        assert!(anon.contains(&public_tree), "/public subtree tree included");
+
+        // listed reader: sees the /secret tree (caller-aware, not a blanket deny).
+        let rd = allowed_tree_set_for_caller(&bare, &rules, true, OWNER, Some(reader)).unwrap();
+        assert!(rd.contains(&secret_tree), "listed reader sees the /secret tree");
+
+        // owner: sees every reachable tree.
+        let ow = allowed_tree_set_for_caller(&bare, &rules, true, OWNER, Some(OWNER)).unwrap();
+        assert!(
+            ow.contains(&secret_tree) && ow.contains(&public_tree) && ow.contains(&root_tree),
+            "owner sees all reachable trees"
+        );
+    }
+
+    #[test]
+    fn allowed_tree_set_excludes_dangling_tree() {
+        use std::io::Write;
+        use std::process::Stdio;
+        let (_td, bare, secret_oid, _p) = fixture();
+        // A DANGLING tree: written to the ODB but referenced by no commit. Uses a
+        // UNIQUE entry name so its oid is content-distinct from every reachable tree
+        // (a content-identical tree would dedup to a reachable oid — that is T2, not
+        // danglingness). The reachable-only walk never enumerates it -> fail closed.
+        let mut child = Command::new("git")
+            .args(["mktree"])
+            .current_dir(&bare)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        write!(
+            child.stdin.as_mut().unwrap(),
+            "100644 blob {secret_oid}\tdangling-only-unreferenced.txt\n"
+        )
+        .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "git mktree");
+        let dangling = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        let rules = [rule("/secret/**", &[])];
+        for caller in [None, Some(OWNER)] {
+            let set = allowed_tree_set_for_caller(&bare, &rules, true, OWNER, caller).unwrap();
+            assert!(
+                !set.contains(&dangling),
+                "dangling tree must never be in the reachable allowed-set (caller={caller:?})"
+            );
+        }
     }
 
     #[test]
