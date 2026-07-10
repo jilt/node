@@ -1816,6 +1816,10 @@ mod tests {
         secret_oid: String,
         public_oid: String,
         secret_tree_oid: String,
+        public_tree_oid: String,
+        root_tree_oid: String,
+        commit_oid: String,
+        tag_oid: String,
     }
     impl Drop for CidFixture {
         fn drop(&mut self) {
@@ -1849,6 +1853,8 @@ mod tests {
         run(&["config", "user.name", "t"], &src);
         run(&["add", "."], &src);
         run(&["commit", "-qm", "seed"], &src);
+        // Annotated tag of the commit — exercises the "tags stay served" guard.
+        run(&["tag", "-a", "-m", "annotated", "v1", "HEAD"], &src);
         let oid = |rev: &str| {
             let out = Command::new("git")
                 .args(["rev-parse", rev])
@@ -1861,6 +1867,10 @@ mod tests {
         let secret_oid = oid("HEAD:secret/b.txt");
         let public_oid = oid("HEAD:public/a.txt");
         let secret_tree_oid = oid("HEAD:secret");
+        let public_tree_oid = oid("HEAD:public");
+        let root_tree_oid = oid("HEAD^{tree}");
+        let commit_oid = oid("HEAD");
+        let tag_oid = oid("refs/tags/v1");
         let mut guards = vec![src.clone()];
         for name in bare_names {
             let bare = std::path::PathBuf::from("/tmp")
@@ -1886,6 +1896,10 @@ mod tests {
             secret_oid,
             public_oid,
             secret_tree_oid,
+            public_tree_oid,
+            root_tree_oid,
+            commit_oid,
+            tag_oid,
         }
     }
 
@@ -1913,6 +1927,21 @@ mod tests {
             .await
             .unwrap();
         (st, String::from_utf8_lossy(&b).to_string())
+    }
+    /// Raw body bytes (NOT lossy-decoded). A git tree body stores each child oid
+    /// as 32 RAW bytes that `from_utf8_lossy` mangles to U+FFFD, so a hex
+    /// `contains` check on `cid_parts`'s String is vacuous. #135 deny tests must
+    /// witness the leak on these raw bytes.
+    async fn cid_bytes(resp: axum::response::Response) -> (StatusCode, Vec<u8>) {
+        let st = resp.status();
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (st, b.to_vec())
+    }
+    /// True if `needle` appears as a contiguous byte subsequence of `haystack`.
+    fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
     }
     fn cid_anon(cid: &str) -> Request<Body> {
         Request::builder()
@@ -2033,15 +2062,87 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "listed reader reads the blob");
         assert!(body.contains("TOP SECRET"));
 
-        // KTD3: anon tree CID under /secret → 200 (trees/commits are not withheld).
-        let (st, _) = cid_parts(
+        // #135: anon tree CID under withheld /secret → 404; structure must NOT leak.
+        // The tree body lists `b.txt` -> secret_oid (32 RAW bytes), so witness the
+        // leak on the raw body, never the lossy-decoded string (hex never appears).
+        let (st, body) = cid_bytes(
             cid_router(&state)
                 .oneshot(cid_anon(&tree_cid))
                 .await
                 .unwrap(),
         )
         .await;
-        assert_eq!(st, StatusCode::OK, "tree object is served to anon (KTD3)");
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "withheld subtree tree must not be served to anon (#135)"
+        );
+        assert!(
+            !bytes_contain(&body, b"b.txt"),
+            "child filename must not leak in the 404 body"
+        );
+        let secret_raw = hex::decode(&fx.secret_oid).expect("hex oid");
+        assert!(
+            !bytes_contain(&body, &secret_raw),
+            "child oid (raw bytes) must not leak in the 404 body"
+        );
+
+        // Over-denial guards — the tree gate must NOT break legitimate reads.
+        // Listed reader (signed) still sees the withheld subtree's tree structure.
+        let (st, body) = cid_bytes(
+            cid_router(&state)
+                .oneshot(cid_signed(&reader, &tree_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "listed reader reads the withheld subtree tree"
+        );
+        assert!(
+            bytes_contain(&body, b"b.txt"),
+            "reader's tree body contains the child structure"
+        );
+
+        // Root tree (path "/") stays served to anon who passes the "/" gate.
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&cid_for_oid(&fx.root_tree_oid)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "root tree stays served (must-serve)");
+
+        // /public subtree tree stays served to anon (allowed path).
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&cid_for_oid(&fx.public_tree_oid)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "public subtree tree stays served");
+
+        // Commit and annotated tag objects stay served (unchanged by #135).
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&cid_for_oid(&fx.commit_oid)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "commit object stays served");
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&cid_for_oid(&fx.tag_oid)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "tag object stays served");
 
         // R3: public blob anon → 200 (non-withheld content not affected).
         let (st, _) = cid_parts(

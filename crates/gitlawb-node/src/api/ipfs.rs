@@ -27,7 +27,9 @@ use std::str::FromStr;
 use crate::auth::AuthenticatedDid;
 use crate::error::{AppError, Result};
 use crate::git::store;
-use crate::git::visibility_pack::{allowed_blob_set_for_caller, has_path_scoped_rule};
+use crate::git::visibility_pack::{
+    allowed_blob_set_for_caller, allowed_tree_set_for_caller, has_path_scoped_rule,
+};
 use crate::state::AppState;
 use crate::visibility::{visibility_check, Decision};
 
@@ -102,7 +104,12 @@ pub async fn get_by_cid(
     // (`allowed_blob_set_for_caller`) so dangling blobs — never enumerated by
     // the reachable walk — fail closed instead of slipping through an empty
     // deny entry (#126).
-    let mut allowed_memo: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut allowed_blob_memo: HashMap<String, HashSet<String>> = HashMap::new();
+    // The tree analog (#135): a withheld subtree's tree object is gated the same way
+    // a withheld blob is, so its structure cannot leak by CID where get_tree protects
+    // it. Built lazily and only for a tree fetch (a request is one CID = one object
+    // type), so one request builds exactly one of the two sets — no double walk.
+    let mut allowed_tree_memo: HashMap<String, HashSet<String>> = HashMap::new();
 
     for repo in &repos {
         // Repo-level read gate against THIS row's own rules (KTD2a).
@@ -131,26 +138,48 @@ pub async fn get_by_cid(
             }
         };
 
-        // Per-blob gating only applies when a path-scoped rule exists (KTD4).
-        // Without any path-scoped rule, the "/" gate above is the whole story.
-        // Trees/commits are always served under path-scoped rules (KTD3).
+        // Per-object gating applies only when a path-scoped rule exists (KTD4);
+        // without one, the "/" gate above is the whole story. Under a path-scoped
+        // rule a `blob` is gated against the caller's allowed-blob-set and a `tree`
+        // against the allowed-tree-set (#135 — a withheld subtree's tree structure
+        // must not leak by CID where get_tree protects it). A `commit`/`tag` exposes
+        // only "/"-level metadata the caller already cleared the "/" gate for, so it
+        // falls through to serve.
         let path_scoped = has_path_scoped_rule(rules);
-        if path_scoped && obj_type == "blob" {
-            if !allowed_memo.contains_key(&repo.id) {
+        if path_scoped && (obj_type == "blob" || obj_type == "tree") {
+            let is_blob = obj_type == "blob";
+            let memo = if is_blob {
+                &mut allowed_blob_memo
+            } else {
+                &mut allowed_tree_memo
+            };
+            if !memo.contains_key(&repo.id) {
                 let rp = repo_path.clone();
                 let r = rules.to_vec();
                 let is_public = repo.is_public;
                 let owner = repo.owner_did.clone();
                 let caller_for_walk = caller_owned.clone();
                 // Full-history walk shells out to git — keep it off the async runtime.
+                // Only the fetched object's type is walked (blob XOR tree), so a tree
+                // fetch never pays the blob walk and vice-versa.
                 let walk = tokio::task::spawn_blocking(move || {
-                    allowed_blob_set_for_caller(
-                        &rp,
-                        &r,
-                        is_public,
-                        &owner,
-                        caller_for_walk.as_deref(),
-                    )
+                    if is_blob {
+                        allowed_blob_set_for_caller(
+                            &rp,
+                            &r,
+                            is_public,
+                            &owner,
+                            caller_for_walk.as_deref(),
+                        )
+                    } else {
+                        allowed_tree_set_for_caller(
+                            &rp,
+                            &r,
+                            is_public,
+                            &owner,
+                            caller_for_walk.as_deref(),
+                        )
+                    }
                 })
                 .await;
                 // Fail closed on EITHER a task panic (JoinError) or a walk error:
@@ -159,17 +188,17 @@ pub async fn get_by_cid(
                 let set = match walk {
                     Ok(Ok(set)) => set,
                     Ok(Err(e)) => {
-                        tracing::warn!(repo = %repo.name, err = %e, "allowed-blob walk failed; skipping repo");
+                        tracing::warn!(repo = %repo.name, err = %e, "allowed-set walk failed; skipping repo");
                         continue;
                     }
                     Err(e) => {
-                        tracing::warn!(repo = %repo.name, err = %e, "allowed-blob walk task panicked; skipping repo");
+                        tracing::warn!(repo = %repo.name, err = %e, "allowed-set walk task panicked; skipping repo");
                         continue;
                     }
                 };
-                allowed_memo.insert(repo.id.clone(), set);
+                memo.insert(repo.id.clone(), set);
             }
-            let in_allowed = allowed_memo
+            let in_allowed = memo
                 .get(&repo.id)
                 .is_some_and(|set| set.contains(&sha256_hex));
             if !in_allowed {
