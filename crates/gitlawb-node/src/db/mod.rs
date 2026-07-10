@@ -532,12 +532,6 @@ const MIGRATIONS: &[Migration] = &[
             )"#,
             // Migrate existing installs that lack the pinata_cid column
             "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS pinata_cid TEXT",
-            // GET /ipfs/{cid} resolves an incoming CID -> git oid via this column
-            // (#173); index it so the lookup is not a per-request table scan.
-            // Non-unique on purpose: cid is a function of raw content, so a UNIQUE
-            // index could reject a legitimate record_pinned_cid insert, and any
-            // colliding rows would serve byte-identical content anyway.
-            "CREATE INDEX IF NOT EXISTS idx_pinned_cids_cid ON pinned_cids(cid)",
             r#"CREATE TABLE IF NOT EXISTS branch_cids (
                 repo       TEXT NOT NULL,
                 ref_name   TEXT NOT NULL,
@@ -876,6 +870,19 @@ const MIGRATIONS: &[Migration] = &[
                    ) dups WHERE dups.rn > 1
                )"#,
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_ref_certs_repo_ref ON ref_certificates(repo_id, ref_name)",
+        ],
+    },
+    Migration {
+        version: 11,
+        name: "pinned_cids_cid_index",
+        stmts: &[
+            // GET /ipfs/{cid} resolves an incoming CID -> git oid via pinned_cids.cid
+            // (#173); index it so the per-request lookup is not a table scan. This is
+            // a NEW versioned migration (not appended to the applied v1 bundle) so a
+            // node already past v1 actually gets the index. Non-unique on purpose: cid
+            // is a function of raw content, so a UNIQUE index could reject a legitimate
+            // record_pinned_cid insert, and colliding rows serve byte-identical content.
+            "CREATE INDEX IF NOT EXISTS idx_pinned_cids_cid ON pinned_cids(cid)",
         ],
     },
 ];
@@ -5053,6 +5060,51 @@ mod ref_certificate_tests {
         assert_eq!(
             certs[0].id, "keep-id",
             "dedup keeps the most recent (later issued_at)"
+        );
+    }
+
+    /// INV-7: upgrade-path test — an existing node already past v1 must still get
+    /// the `pinned_cids.cid` index. It ships as its OWN v11 migration (not appended
+    /// to the applied v1 bundle), so dropping the index + its `schema_migrations`
+    /// row and re-running migrations must recreate it, exercising the real code
+    /// path rather than hand-copying the SQL.
+    #[sqlx::test]
+    async fn v11_pinned_cids_cid_index_applies_on_upgrade(pool: PgPool) {
+        async fn index_exists(pool: &PgPool) -> bool {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname = 'idx_pinned_cids_cid')",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        assert!(
+            index_exists(&pool).await,
+            "fresh migration chain creates the index"
+        );
+
+        // Simulate a node at v10 (pre-v11): drop the index and its migration record.
+        sqlx::query("DROP INDEX IF EXISTS idx_pinned_cids_cid")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 11")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !index_exists(&pool).await,
+            "precondition: index and its migration record removed"
+        );
+
+        // Re-run migrations: v11 re-applies and recreates the index on the upgrade.
+        db.run_migrations().await.unwrap();
+        assert!(
+            index_exists(&pool).await,
+            "v11 must recreate idx_pinned_cids_cid on an upgrading node"
         );
     }
 
