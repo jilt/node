@@ -45,13 +45,15 @@ use crate::visibility::{visibility_check, Decision};
 /// row than the one read (KTD2a). We check object existence via
 /// `store::object_type` *before* the expensive reachability walk so random-CID
 /// spray cannot trigger full-history git walks on repos that don't carry the
-/// object. When the row carries path-scoped rules (KTD4) the served object
-/// must be either a non-blob (trees/commits are structural; KTD3) OR a blob
-/// in the caller's *reachable* allowed-set (`allowed_blob_set_for_caller`).
-/// The reachable allowed-set excludes dangling blobs — a blob written via
-/// `git hash-object -w` and never committed has no path to gate, so it is
-/// fail-closed 404'd under path-scoped rules (#126). Denial and genuine
-/// not-found both fall through to an opaque 404.
+/// object. When the row carries path-scoped rules (KTD4) the served object must
+/// be either a `commit`/`tag` (root-level metadata the caller already cleared the
+/// `"/"` gate for) OR a `blob`/`tree` in the caller's *reachable* allowed-set
+/// (`allowed_blob_set_for_caller` / `allowed_tree_set_for_caller`). A withheld
+/// subtree's tree object is denied here exactly as `get_tree` denies its path, so
+/// its child names and oids cannot leak by CID (#135). The reachable allowed-sets
+/// exclude dangling objects — a blob or tree written via plumbing and never
+/// committed has no path to gate, so it is fail-closed 404'd under path-scoped
+/// rules (#126). Denial and genuine not-found both fall through to an opaque 404.
 ///
 /// Scope: this closes the direct unauthenticated scan, including the dangling
 /// case. A stale-public mirror row still serves withheld content (tracked

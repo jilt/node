@@ -337,9 +337,9 @@ pub fn replicable_blob_set(
 /// to authorize the blob at.
 ///
 /// A blob reachable at an allowed path is included even when also denied
-/// elsewhere (its content is readable to this caller elsewhere). Trees and
-/// commits are NOT included here; the caller decides per object type whether
-/// the allow-set applies (it does not for trees/commits — KTD3).
+/// elsewhere (its content is readable to this caller elsewhere). This set is
+/// blobs only; trees have the parallel `allowed_tree_set_for_caller` (#135), and
+/// commits/tags are served as root-level structure once the `"/"` gate passes.
 pub fn allowed_blob_set_for_caller(
     repo_path: &Path,
     rules: &[VisibilityRule],
@@ -823,7 +823,10 @@ mod tests {
 
         // listed reader: sees the /secret tree (caller-aware, not a blanket deny).
         let rd = allowed_tree_set_for_caller(&bare, &rules, true, OWNER, Some(reader)).unwrap();
-        assert!(rd.contains(&secret_tree), "listed reader sees the /secret tree");
+        assert!(
+            rd.contains(&secret_tree),
+            "listed reader sees the /secret tree"
+        );
 
         // owner: sees every reachable tree.
         let ow = allowed_tree_set_for_caller(&bare, &rules, true, OWNER, Some(OWNER)).unwrap();
