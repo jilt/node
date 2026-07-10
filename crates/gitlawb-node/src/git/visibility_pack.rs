@@ -1,7 +1,11 @@
-//! Resolve which blob OIDs must be withheld from a caller because every path
-//! at which the blob appears is denied by the repo's visibility rules. Trees
-//! and commits are never withheld (mode B keeps SHAs intact); only blob
-//! content is held back.
+//! Resolve which git objects must be withheld from a caller under the repo's
+//! visibility rules. A blob is withheld when every path at which it appears is
+//! denied. Since #135 a tree is likewise withheld on the CID serve surface
+//! (`GET /ipfs/{cid}`) when every path at which it appears is denied, via the
+//! parallel `allowed_tree_set_for_caller` — so a withheld subtree's structure does
+//! not leak by content address. Commits and tags are never withheld here, and
+//! trees still replicate freely on the pin path (the withheld-tree pin gap is
+//! tracked as #172). Mode B keeps all object SHAs intact; only readability is gated.
 
 use crate::db::VisibilityRule;
 use crate::git::store;
@@ -129,8 +133,11 @@ fn assert_all_refs_are_commits(repo_path: &Path) -> Result<()> {
 /// where HEAD reaches commits no ref does). Empty on an unborn branch. The single
 /// commit-enumeration seam shared by `object_paths` and the root-tree derivation, so
 /// the tree walk and the root-tree inclusion can never disagree on which commits are
-/// reachable. Fails closed on a rev-list error.
+/// reachable — callers compute the set ONCE and pass it to both. Runs the fail-closed
+/// ref guard first (a ref pointing at a non-commit aborts), then enumerates. Fails
+/// closed on a rev-list error.
 fn reachable_commits(repo_path: &Path) -> Result<Vec<String>> {
+    assert_all_refs_are_commits(repo_path)?;
     let head = store::head_commit(repo_path).context("resolve HEAD failed")?;
     let mut rev_args = vec!["rev-list", "--all"];
     if head.is_some() {
@@ -173,16 +180,15 @@ fn reachable_commits(repo_path: &Path) -> Result<Vec<String>> {
 /// and paths carry a leading "/" to match the glob form of visibility rules
 /// ("/secret/**").
 ///
-/// Fails closed: if commit enumeration or any tree walk fails — or a path is not
-/// valid UTF-8 — it returns an error so the caller aborts the serve/pin rather than
-/// producing a partial (under-withheld) set.
-fn object_paths(repo_path: &Path) -> Result<HashSet<(String, String, String)>> {
-    assert_all_refs_are_commits(repo_path)?;
-
+/// Fails closed: if any tree walk fails — or a path is not valid UTF-8 — it returns
+/// an error so the caller aborts the serve/pin rather than producing a partial
+/// (under-withheld) set. Takes the `commits` from [`reachable_commits`] (which runs
+/// the ref guard) so blob and tree walks share one commit enumeration.
+fn object_paths(repo_path: &Path, commits: &[String]) -> Result<HashSet<(String, String, String)>> {
     let mut out: HashSet<(String, String, String)> = HashSet::new();
-    for commit in reachable_commits(repo_path)? {
+    for commit in commits {
         let listing = std::process::Command::new("git")
-            .args(["ls-tree", "-rzt", &commit])
+            .args(["ls-tree", "-rzt", commit])
             .current_dir(repo_path)
             .output()
             .context("git ls-tree -rzt failed")?;
@@ -231,7 +237,8 @@ fn object_paths(repo_path: &Path) -> Result<HashSet<(String, String, String)>> {
 /// (`withheld_blob_oids`, `replicable_blob_set`, `allowed_blob_set_for_caller`) is
 /// unaffected. See [`object_paths`] for the walk and fail-closed semantics.
 fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
-    Ok(object_paths(repo_path)?
+    let commits = reachable_commits(repo_path)?;
+    Ok(object_paths(repo_path, &commits)?
         .into_iter()
         .filter(|(_, _, kind)| kind == "blob")
         .map(|(oid, path, _)| (oid, path))
@@ -340,6 +347,25 @@ pub fn replicable_blob_set(
 /// elsewhere (its content is readable to this caller elsewhere). This set is
 /// blobs only; trees have the parallel `allowed_tree_set_for_caller` (#135), and
 /// commits/tags are served as root-level structure once the `"/"` gate passes.
+/// The OIDs from a `(oid, "/path")` listing that visibility ALLOWS `caller` at some
+/// path — the shared inner loop of the blob and tree allowed-sets. An oid reachable
+/// at an allowed path is kept even when also reachable at a denied one.
+fn allowed_set_from_pairs<'a>(
+    pairs: impl IntoIterator<Item = &'a (String, String)>,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> HashSet<String> {
+    pairs
+        .into_iter()
+        .filter(|(_, path)| {
+            visibility_check(rules, is_public, owner_did, caller, path) == Decision::Allow
+        })
+        .map(|(oid, _)| oid.clone())
+        .collect()
+}
+
 pub fn allowed_blob_set_for_caller(
     repo_path: &Path,
     rules: &[VisibilityRule],
@@ -347,47 +373,62 @@ pub fn allowed_blob_set_for_caller(
     owner_did: &str,
     caller: Option<&str>,
 ) -> Result<HashSet<String>> {
-    let pairs = blob_paths(repo_path)?;
-    let mut allowed = HashSet::new();
-    for (oid, path) in &pairs {
-        if visibility_check(rules, is_public, owner_did, caller, path) == Decision::Allow {
-            allowed.insert(oid.clone());
+    Ok(allowed_set_from_pairs(
+        &blob_paths(repo_path)?,
+        rules,
+        is_public,
+        owner_did,
+        caller,
+    ))
+}
+
+/// Root tree oid of every reachable commit, at "/". `ls-tree` never emits a commit's
+/// own root tree (it lists entries *under* a tree), so it is added explicitly here.
+/// Resolved in ONE `git log --no-walk --format=%T` pass over the shared commit set —
+/// not a per-commit `rev-parse` — so a tree-set walk costs the same subprocess order
+/// as the blob walk. A commit whose root tree git cannot resolve fails the pass
+/// (bail), failing closed.
+fn root_tree_pairs(repo_path: &Path, commits: &[String]) -> Result<HashSet<(String, String)>> {
+    if commits.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut args: Vec<&str> = vec!["log", "--no-walk=unsorted", "--format=%T"];
+    args.extend(commits.iter().map(String::as_str));
+    let out = std::process::Command::new("git")
+        .args(&args)
+        .current_dir(repo_path)
+        .output()
+        .context("git log --no-walk --format=%T failed")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git log --no-walk --format=%T failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let mut set = HashSet::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let oid = line.trim();
+        if !oid.is_empty() {
+            set.insert((oid.to_string(), "/".to_string()));
         }
     }
-    Ok(allowed)
+    Ok(set)
 }
 
 /// Every `(tree_oid, "/path")` pair reachable in `repo_path`: the `kind == "tree"`
 /// slice of [`object_paths`] (subtree trees at their directory paths) PLUS every
-/// reachable commit's root tree at "/". `ls-tree` never emits a commit's own root
-/// tree (it lists entries *under* a tree), so the root is added explicitly via
-/// `<commit>^{tree}` over the same [`reachable_commits`] set — without it the root
-/// tree would be wrongly denied. The tree analog of [`blob_paths`].
+/// reachable commit's root tree at "/" (see [`root_tree_pairs`]). Computes the
+/// reachable-commit set ONCE and drives both the ls-tree walk and the root-tree pass
+/// from it, so the two cannot diverge and neither re-enumerates. The tree analog of
+/// [`blob_paths`].
 fn tree_paths(repo_path: &Path) -> Result<HashSet<(String, String)>> {
-    let mut out: HashSet<(String, String)> = object_paths(repo_path)?
+    let commits = reachable_commits(repo_path)?;
+    let mut out: HashSet<(String, String)> = object_paths(repo_path, &commits)?
         .into_iter()
         .filter(|(_, _, kind)| kind == "tree")
         .map(|(oid, path, _)| (oid, path))
         .collect();
-    // Root tree of each reachable commit, at "/". Derived from the same commit set
-    // object_paths walks, so reachability cannot diverge between the two.
-    for commit in reachable_commits(repo_path)? {
-        let resolved = std::process::Command::new("git")
-            .args(["rev-parse", &format!("{commit}^{{tree}}")])
-            .current_dir(repo_path)
-            .output()
-            .context("git rev-parse <commit>^{tree} failed")?;
-        if !resolved.status.success() {
-            anyhow::bail!(
-                "git rev-parse {commit}^{{tree}} failed: {}",
-                String::from_utf8_lossy(&resolved.stderr)
-            );
-        }
-        let oid = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
-        if !oid.is_empty() {
-            out.insert((oid, "/".to_string()));
-        }
-    }
+    out.extend(root_tree_pairs(repo_path, &commits)?);
     Ok(out)
 }
 
@@ -406,14 +447,13 @@ pub fn allowed_tree_set_for_caller(
     owner_did: &str,
     caller: Option<&str>,
 ) -> Result<HashSet<String>> {
-    let pairs = tree_paths(repo_path)?;
-    let mut allowed = HashSet::new();
-    for (oid, path) in &pairs {
-        if visibility_check(rules, is_public, owner_did, caller, path) == Decision::Allow {
-            allowed.insert(oid.clone());
-        }
-    }
-    Ok(allowed)
+    Ok(allowed_set_from_pairs(
+        &tree_paths(repo_path)?,
+        rules,
+        is_public,
+        owner_did,
+        caller,
+    ))
 }
 
 /// Objects safe to replicate, failing closed on blobs (#99). A candidate
@@ -764,7 +804,7 @@ mod tests {
     #[test]
     fn object_paths_emits_trees_and_blob_paths_is_the_blob_slice() {
         let (_td, bare, secret_oid, public_oid) = fixture();
-        let objs = object_paths(&bare).unwrap();
+        let objs = object_paths(&bare, &reachable_commits(&bare).unwrap()).unwrap();
 
         // Blob records survive the `-rzt` change, at their paths (unchanged).
         assert!(objs.contains(&(secret_oid.clone(), "/secret/b.txt".into(), "blob".into())));
