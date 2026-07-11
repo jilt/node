@@ -430,10 +430,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _root = mock_root(&mut server).await;
         let _m = server
-            .mock(
-                "GET",
-                mockito::Matcher::Regex(r"/hooks$".to_string()),
-            )
+            .mock("GET", mockito::Matcher::Regex(r"/hooks$".to_string()))
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository not found"}"#)

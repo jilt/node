@@ -892,7 +892,10 @@ mod tests {
             Some(dir.path().to_path_buf()),
         )
         .await;
-        assert!(result.is_err(), "cmd_list must Err on 404, not print 'No pull requests'");
+        assert!(
+            result.is_err(),
+            "cmd_list must Err on 404, not print 'No pull requests'"
+        );
     }
 
     #[tokio::test]
@@ -915,7 +918,10 @@ mod tests {
             Some(dir.path().to_path_buf()),
         )
         .await;
-        assert!(result.is_err(), "cmd_view must Err on 404, not print a stub PR");
+        assert!(
+            result.is_err(),
+            "cmd_view must Err on 404, not print a stub PR"
+        );
     }
 
     #[tokio::test]
@@ -924,7 +930,10 @@ mod tests {
         write_identity(&dir);
         let mut server = mockito::Server::new_async().await;
         let _m = server
-            .mock("GET", mockito::Matcher::Regex(r"/pulls/1/diff$".to_string()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/pulls/1/diff$".to_string()),
+            )
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository not found"}"#)
@@ -937,7 +946,10 @@ mod tests {
             Some(dir.path().to_path_buf()),
         )
         .await;
-        assert!(result.is_err(), "cmd_diff must Err on 404, not print 'No diff'");
+        assert!(
+            result.is_err(),
+            "cmd_diff must Err on 404, not print 'No diff'"
+        );
     }
 
     #[tokio::test]
@@ -946,7 +958,10 @@ mod tests {
         write_identity(&dir);
         let mut server = mockito::Server::new_async().await;
         let _m = server
-            .mock("GET", mockito::Matcher::Regex(r"/pulls/1/comments$".to_string()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/pulls/1/comments$".to_string()),
+            )
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository not found"}"#)

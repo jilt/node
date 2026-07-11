@@ -564,6 +564,9 @@ mod tests {
             .create_async()
             .await;
         let result = cmd_list(Some("alice/secret".to_string()), None, server.url(), None).await;
-        assert!(result.is_err(), "bounty list --repo must Err on a gated 404");
+        assert!(
+            result.is_err(),
+            "bounty list --repo must Err on a gated 404"
+        );
     }
 }

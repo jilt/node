@@ -358,7 +358,10 @@ mod tests {
 
     // ── gl status section denial surfacing (#123 / INV-8, R5) ────────────
 
-    async fn get_response(server: &mut mockito::Server, status: usize) -> Result<reqwest::Response> {
+    async fn get_response(
+        server: &mut mockito::Server,
+        status: usize,
+    ) -> Result<reqwest::Response> {
         let _m = server
             .mock("GET", "/x")
             .with_status(status)

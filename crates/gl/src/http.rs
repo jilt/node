@@ -607,7 +607,12 @@ mod tests {
 
     /// Drive a real `reqwest::Response` off a mockito mock so `read_json` sees an
     /// actual HTTP status + body, the same shape the gated read arms produce.
-    async fn response_for(server: &mut Server, status: usize, body: &str, json: bool) -> reqwest::Response {
+    async fn response_for(
+        server: &mut Server,
+        status: usize,
+        body: &str,
+        json: bool,
+    ) -> reqwest::Response {
         let mut m = server.mock("GET", "/x").with_status(status).with_body(body);
         if json {
             m = m.with_header("content-type", "application/json");
@@ -619,7 +624,13 @@ mod tests {
     #[tokio::test]
     async fn read_json_returns_body_on_2xx() {
         let mut server = Server::new_async().await;
-        let resp = response_for(&mut server, 200, r#"{"name":"r","owner_did":"did:gitlawb:z"}"#, true).await;
+        let resp = response_for(
+            &mut server,
+            200,
+            r#"{"name":"r","owner_did":"did:gitlawb:z"}"#,
+            true,
+        )
+        .await;
         let v = read_json(resp, "repo").await.unwrap();
         assert_eq!(v["name"], "r");
     }
@@ -627,7 +638,13 @@ mod tests {
     #[tokio::test]
     async fn read_json_errs_on_404_surfacing_message_and_status() {
         let mut server = Server::new_async().await;
-        let resp = response_for(&mut server, 404, r#"{"message":"repository 'o/r' not found"}"#, true).await;
+        let resp = response_for(
+            &mut server,
+            404,
+            r#"{"message":"repository 'o/r' not found"}"#,
+            true,
+        )
+        .await;
         let err = read_json(resp, "repo").await.unwrap_err().to_string();
         assert!(err.contains("404"), "err={err}");
         assert!(err.contains("not found"), "err={err}");
@@ -657,7 +674,13 @@ mod tests {
         // INV-6: a hostile node embeds ESC, BEL, and a right-to-left override in
         // the error message; none may reach the terminal verbatim.
         let mut server = Server::new_async().await;
-        let resp = response_for(&mut server, 404, r#"{"message":"a\u001b[31mb\u0007c\u202ed"}"#, true).await;
+        let resp = response_for(
+            &mut server,
+            404,
+            r#"{"message":"a\u001b[31mb\u0007c\u202ed"}"#,
+            true,
+        )
+        .await;
         let err = read_json(resp, "repo").await.unwrap_err().to_string();
         assert!(!err.contains('\u{1b}'), "ESC leaked: {err:?}");
         assert!(!err.contains('\u{7}'), "BEL leaked: {err:?}");
