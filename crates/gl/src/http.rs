@@ -672,4 +672,22 @@ mod tests {
         let resp = response_for(&mut server, 200, "this is not json", false).await;
         assert!(read_json(resp, "repo").await.is_err());
     }
+
+    #[tokio::test]
+    async fn read_json_errs_on_empty_2xx_body() {
+        // A zero-byte 200 body must be an `Err`, not a silent `Ok(Null)`.
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 200, "", false).await;
+        assert!(read_json(resp, "repo").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_json_errs_on_non_2xx_json_without_message() {
+        // A non-2xx JSON body that lacks a `message` key falls back to "request failed".
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 403, r#"{"error":"forbidden"}"#, true).await;
+        let err = read_json(resp, "repo").await.unwrap_err().to_string();
+        assert!(err.contains("403"), "err={err}");
+        assert!(err.contains("request failed"), "err={err}");
+    }
 }

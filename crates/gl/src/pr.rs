@@ -939,4 +939,26 @@ mod tests {
         .await;
         assert!(result.is_err(), "cmd_diff must Err on 404, not print 'No diff'");
     }
+
+    #[tokio::test]
+    async fn cmd_comments_surfaces_denial_not_empty() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/pulls/1/comments$".to_string()))
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository not found"}"#)
+            .create_async()
+            .await;
+        let result = cmd_comments(
+            "myrepo".to_string(),
+            1,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await;
+        assert!(result.is_err(), "cmd_comments must Err on a gated 404");
+    }
 }
