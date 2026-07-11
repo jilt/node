@@ -550,6 +550,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"issue not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -563,6 +564,8 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("show failed"), "got: {err}");
         assert!(err.to_string().contains("issue not found"), "got: {err}");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -611,6 +614,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"issue not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -623,6 +627,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("close issue failed"), "got: {err}");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -669,6 +675,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"issue not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -682,6 +689,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("issue not found"), "got: {err}");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
