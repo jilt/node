@@ -77,7 +77,7 @@ pub async fn run(args: WebhookArgs) -> Result<()> {
 }
 
 async fn resolve_owner(client: &NodeClient) -> Result<String> {
-    let info: Value = client.get("/").await?.json().await?;
+    let info = crate::http::read_json(client.get("/").await?, "node info").await?;
     let did = info["did"]
         .as_str()
         .context("node missing DID")?

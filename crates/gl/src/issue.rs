@@ -142,12 +142,7 @@ async fn resolve_repo(
             did.split(':').next_back().unwrap_or(&did).to_string()
         } else {
             let client = NodeClient::new(node, None);
-            let info: Value = client
-                .get("/")
-                .await?
-                .json()
-                .await
-                .context("failed to fetch node info")?;
+            let info = crate::http::read_json(client.get("/").await?, "node info").await?;
             let did = info["did"].as_str().context("node info missing 'did'")?;
             did.split(':').next_back().unwrap_or(did).to_string()
         };

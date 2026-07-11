@@ -275,12 +275,7 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
     let client = NodeClient::new(&node, None);
 
     let url = format!("/api/v1/repos?owner={owner}");
-    let repos: Value = client
-        .get(&url)
-        .await?
-        .json()
-        .await
-        .context("failed to list repos")?;
+    let repos = crate::http::read_json(client.get(&url).await?, "list repos").await?;
     let repos = repos.as_array().context("expected array")?;
 
     if repos.is_empty() {
@@ -898,6 +893,33 @@ mod tests {
         cmd_list(server.url(), Some(dir.path().to_path_buf()))
             .await
             .unwrap();
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_list_repos_surfaces_denial() {
+        // A node error must Err with the status, not trip the vague "expected
+        // array" fallback that hides the node's actual response (INV-8).
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos\?owner=".to_string()),
+            )
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"boom"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_list(server.url(), Some(dir.path().to_path_buf()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"), "got: {err}");
         _m.assert_async().await;
     }
 
