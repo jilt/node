@@ -203,6 +203,7 @@ mod tests {
             // Valid JSON: the parse-without-status-check bug deserializes this
             // into a zero-count success struct and prints "✓ sync triggered".
             .with_body(r#"{"message":"unauthorized"}"#)
+            .expect(1)
             .create_async()
             .await;
         let (args, _dir) = trigger_args(server.url());
@@ -211,6 +212,8 @@ mod tests {
             err.to_string().contains("401"),
             "expected 401 surfaced, got: {err}"
         );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -221,6 +224,7 @@ mod tests {
             .with_status(429)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"slow down"}"#)
+            .expect(1)
             .create_async()
             .await;
         let (args, _dir) = trigger_args(server.url());
@@ -229,6 +233,8 @@ mod tests {
             err.to_string().contains("429"),
             "expected 429 surfaced, got: {err}"
         );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -245,6 +251,7 @@ mod tests {
             // BEL (\u0007); serde decodes them to real control bytes a naive
             // client would print. (The status-check bug fake-successes here.)
             .with_body("{\"message\":\"pwned\\u001b[31m\\u0007bad\"}")
+            .expect(1)
             .create_async()
             .await;
         let (args, _dir) = trigger_args(server.url());
@@ -256,6 +263,8 @@ mod tests {
             s.contains("pwned") && s.contains("bad"),
             "message text dropped: {s:?}"
         );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -302,6 +311,7 @@ mod tests {
             .mock("POST", "/api/v1/sync/trigger")
             .with_status(401)
             .with_body("A".repeat(2_000_000))
+            .expect(1)
             .create_async()
             .await;
         let (args, _dir) = trigger_args(server.url());
@@ -313,6 +323,8 @@ mod tests {
             "error message not bounded: {} chars",
             s.len()
         );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]

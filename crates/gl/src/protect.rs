@@ -245,6 +245,7 @@ mod tests {
             .with_status(400)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"only the repo owner can protect branches"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -257,6 +258,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("protect failed"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
