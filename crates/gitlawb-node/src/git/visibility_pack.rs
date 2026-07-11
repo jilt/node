@@ -1038,16 +1038,23 @@ mod tests {
     }
 
     #[test]
-    fn root_tree_pairs_over_many_commits_does_not_deadlock() {
-        // Scale guard for the #173 P2 fix: root_tree_pairs feeds every reachable
-        // commit oid to `git log --stdin` on STDIN and drains stdout from a separate
-        // thread. The 2-commit test above (~130 bytes each way) cannot reach the
-        // large-bidirectional-IO path; here N commits push ~N*41 bytes of oids in
-        // and ~N*41 bytes of %T out, exceeding the ~64 KiB pipe buffer in BOTH
-        // directions. A regression that writes all of stdin before draining stdout
-        // hangs; recv_timeout turns that into a failure instead of hanging the suite.
-        // It also confirms parity at scale — every distinct root tree is returned.
-        // (Mirrors many_long_named_unresolvable_refs_do_not_deadlock.)
+    fn root_tree_pairs_returns_every_root_tree_at_scale() {
+        // Parity + liveness at scale for root_tree_pairs (#173 P2): feed every
+        // reachable commit oid to `git log --format=%T --stdin` and collect each
+        // commit's root tree. With N commits that is ~N*41 bytes of oids in and
+        // ~N*41 bytes of %T out — past the ~64 KiB pipe buffer in both directions —
+        // so this exercises the large-bidirectional-IO path the 2-commit test above
+        // cannot, and asserts parity: every distinct root tree comes back.
+        //
+        // NOTE: this is NOT a deadlock guard. `git log --stdin` reads its whole
+        // revision list to EOF before emitting any %T, so the naive "write all of
+        // stdin, then drain stdout" form does not deadlock at any scale for this
+        // invocation — verified by reverting root_tree_pairs' writer thread and
+        // running at N=40000 (~1.6 MiB each way): it still returned promptly. The
+        // writer thread is cheap defensive isolation, not load-bearing, and this
+        // test does not claim otherwise. The 30s watchdog is a general liveness
+        // bound so a future regression that genuinely hangs fails fast here rather
+        // than stalling the suite.
         const N: usize = 2500;
         let td = TempDir::new().unwrap();
         let bare = td.path().join("many.git");
@@ -1097,8 +1104,8 @@ mod tests {
         let commits = reachable_commits(&bare).unwrap();
         assert_eq!(commits.len(), N, "all {N} commits reachable");
 
-        // Call root_tree_pairs directly (private, same module) under a watchdog —
-        // this is the exact stdin-oids / stdout-%T surface the fix protects.
+        // Call root_tree_pairs directly (private, same module) under a liveness
+        // watchdog, then assert it returned every distinct root tree.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(root_tree_pairs(&bare, &commits).map(|s| s.len()));
@@ -1106,7 +1113,7 @@ mod tests {
         match rx.recv_timeout(std::time::Duration::from_secs(30)) {
             Ok(Ok(len)) => assert_eq!(len, N, "every distinct root tree returned"),
             Ok(Err(e)) => panic!("root_tree_pairs errored: {e}"),
-            Err(_) => panic!("root_tree_pairs did not return within 30s (stdin/stdout deadlock?)"),
+            Err(_) => panic!("root_tree_pairs did not return within 30s"),
         }
     }
 
