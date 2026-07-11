@@ -736,4 +736,22 @@ mod tests {
         .await
         .unwrap();
     }
+
+    #[tokio::test]
+    async fn cmd_list_surfaces_denial_not_empty() {
+        // A gated 404 on the issue-list read must Err, not print "No issues".
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/alice/secret/issues$".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .create_async()
+            .await;
+        let result = cmd_list("alice/secret".to_string(), server.url(), None).await;
+        assert!(result.is_err(), "issue list must Err on a gated 404");
+    }
 }

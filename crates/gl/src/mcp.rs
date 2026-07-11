@@ -984,7 +984,7 @@ async fn call_tool(
                 }
                 u
             };
-            let resp: Value = client.get_authed(&url).await?.json().await?;
+            let resp = crate::http::read_json(client.get_authed(&url).await?, "bounties").await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -2002,5 +2002,45 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "issue_list must Err on 404");
+    }
+
+    #[tokio::test]
+    async fn pr_view_surfaces_denial_not_stub() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/pulls/1")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "pr_view",
+            json!({"owner": "alice", "repo": "secret", "number": 1}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "pr_view must Err on 404");
+    }
+
+    #[tokio::test]
+    async fn pr_diff_surfaces_denial_not_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/pulls/1/diff")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "pr_diff",
+            json!({"owner": "alice", "repo": "secret", "number": 1}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "pr_diff must Err on 404");
     }
 }

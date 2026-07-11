@@ -231,11 +231,14 @@ async fn cmd_list(
         u
     };
 
-    let resp = client
-        .get_authed(&url)
-        .await
-        .context("failed to connect to node")?;
-    let body: Value = resp.json().await.unwrap_or_default();
+    let body = crate::http::read_json(
+        client
+            .get_authed(&url)
+            .await
+            .context("failed to connect to node")?,
+        "bounties",
+    )
+    .await?;
 
     let bounties = body["bounties"].as_array();
     if let Some(arr) = bounties {
@@ -543,5 +546,24 @@ mod tests {
             .await;
 
         cmd_stats(server.url()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cmd_list_repo_scoped_surfaces_denial_not_empty() {
+        // `gl bounty list --repo owner/name` hits the gated /repos/{o}/{n}/bounties;
+        // a 404 must Err, not silently print nothing (INV-8).
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/repos/alice/secret/bounties".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .create_async()
+            .await;
+        let result = cmd_list(Some("alice/secret".to_string()), None, server.url(), None).await;
+        assert!(result.is_err(), "bounty list --repo must Err on a gated 404");
     }
 }

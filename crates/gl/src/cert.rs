@@ -204,3 +204,26 @@ async fn resolve_cert_id(client: &NodeClient, owner: &str, name: &str, id: &str)
         _ => anyhow::bail!("certificate prefix {id} matches multiple certificates"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cmd_list_surfaces_denial_not_empty() {
+        // A gated 404 on the repo-scoped certs read must Err, not print "No certificates".
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/alice/secret/certs$".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .create_async()
+            .await;
+        let result = cmd_list("alice/secret".to_string(), server.url(), None).await;
+        assert!(result.is_err(), "cert list must Err on a gated 404");
+    }
+}
