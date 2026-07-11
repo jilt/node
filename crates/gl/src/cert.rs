@@ -88,12 +88,7 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
 
     let client = signed_client(&node, dir.as_deref());
     let path = format!("/api/v1/repos/{owner}/{name}/certs");
-    let resp: Value = client
-        .get_authed(&path)
-        .await?
-        .json()
-        .await
-        .context("failed to list certificates")?;
+    let resp = crate::http::read_json(client.get_authed(&path).await?, "certificates").await?;
 
     let certs = resp["certificates"].as_array().cloned().unwrap_or_default();
 
