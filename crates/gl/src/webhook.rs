@@ -434,9 +434,12 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository not found"}"#)
+            .expect(1)
             .create_async()
             .await;
         let result = cmd_list("my-repo".to_string(), server.url()).await;
         assert!(result.is_err(), "webhook list must Err on a gated 404");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 }

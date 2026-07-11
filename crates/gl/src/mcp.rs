@@ -1860,6 +1860,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -1876,6 +1877,8 @@ mod tests {
             .to_string();
         assert!(err.contains("404"), "err={err}");
         assert!(err.contains("not found"), "err={err}");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -1909,6 +1912,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
             .create_async()
             .await;
         let result = call_tool(
@@ -1920,6 +1924,8 @@ mod tests {
         .await;
         assert!(result.is_err(), "repo_commits must Err on 404");
         assert!(result.unwrap_err().to_string().contains("not found"));
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -1930,6 +1936,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
             .create_async()
             .await;
         let result = call_tool(
@@ -1940,6 +1947,8 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "repo_tree must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -1950,6 +1959,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
             .create_async()
             .await;
         let result = call_tool(
@@ -1960,6 +1970,8 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "pr_list must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -1972,6 +1984,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
             .create_async()
             .await;
         let result = call_tool(
@@ -1982,6 +1995,8 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "webhook_list must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -1992,6 +2007,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
             .create_async()
             .await;
         let result = call_tool(
@@ -2002,6 +2018,8 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "issue_list must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -2012,6 +2030,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
             .create_async()
             .await;
         let result = call_tool(
@@ -2022,6 +2041,8 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "pr_view must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -2032,6 +2053,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
             .create_async()
             .await;
         let result = call_tool(
@@ -2042,5 +2064,7 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "pr_diff must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 }

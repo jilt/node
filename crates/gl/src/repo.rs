@@ -815,6 +815,7 @@ mod tests {
             .with_status(409)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository already exists"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -830,6 +831,8 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -997,6 +1000,7 @@ mod tests {
             .with_status(400)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"you already have a repo named myrepo"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -1012,6 +1016,8 @@ mod tests {
             err.to_string().contains("already have a repo"),
             "got: {err}"
         );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -1279,6 +1285,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -1291,6 +1298,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("not found"), "got: {err}");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _repo.assert_async().await;
     }
 
     // ── Gated CLI reads surface node denials, not empty renders (#123 / INV-8) ──
@@ -1307,6 +1316,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
             .create_async()
             .await;
         let result = cmd_commits(
@@ -1319,6 +1329,8 @@ mod tests {
         .await;
         assert!(result.is_err(), "cmd_commits must Err on 404");
         assert!(result.unwrap_err().to_string().contains("not found"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -1332,9 +1344,12 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
             .create_async()
             .await;
         let result = cmd_label_list("alice/secret".to_string(), server.url(), None).await;
         assert!(result.is_err(), "cmd_label_list must Err on 404");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 }

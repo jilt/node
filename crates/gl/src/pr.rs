@@ -660,6 +660,7 @@ mod tests {
             .with_status(422)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"branch not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -677,6 +678,8 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("branch not found"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -774,6 +777,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"PR not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -787,6 +791,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("PR not found"), "got: {err}");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -884,6 +890,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository not found"}"#)
+            .expect(1)
             .create_async()
             .await;
         let result = cmd_list(
@@ -896,6 +903,8 @@ mod tests {
             result.is_err(),
             "cmd_list must Err on 404, not print 'No pull requests'"
         );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -909,6 +918,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository not found"}"#)
+            .expect(1)
             .create_async()
             .await;
         let result = cmd_view(
@@ -922,6 +932,8 @@ mod tests {
             result.is_err(),
             "cmd_view must Err on 404, not print a stub PR"
         );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -937,6 +949,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository not found"}"#)
+            .expect(1)
             .create_async()
             .await;
         let result = cmd_diff(
@@ -950,6 +963,8 @@ mod tests {
             result.is_err(),
             "cmd_diff must Err on 404, not print 'No diff'"
         );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -965,6 +980,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository not found"}"#)
+            .expect(1)
             .create_async()
             .await;
         let result = cmd_comments(
@@ -975,5 +991,7 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "cmd_comments must Err on a gated 404");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 }

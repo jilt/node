@@ -171,6 +171,7 @@ mod tests {
             .with_status(401)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"invalid signature"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -187,6 +188,8 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("invalid signature"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
