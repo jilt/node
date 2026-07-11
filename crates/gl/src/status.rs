@@ -81,11 +81,10 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         let pr_resp = client
             .get(&format!("/api/v1/repos/{short_owner}/{repo_name}/pulls"))
             .await;
-        if let Ok(r) = pr_resp {
-            if !r.status().is_success() {
-                // A gated read must not render as "no open PRs" (INV-8); surface it.
-                println!("  PRs       unavailable ({})", r.status());
-            } else if let Ok(body) = r.json::<Value>().await {
+        if let Some(line) = section_unavailable_line("PRs", &pr_resp) {
+            println!("{line}");
+        } else if let Ok(r) = pr_resp {
+            if let Ok(body) = r.json::<Value>().await {
                 let prs = body["pulls"].as_array().cloned().unwrap_or_default();
                 let open: Vec<_> = prs
                     .iter()
@@ -111,10 +110,10 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         let issue_resp = client
             .get(&format!("/api/v1/repos/{short_owner}/{repo_name}/issues"))
             .await;
-        if let Ok(r) = issue_resp {
-            if !r.status().is_success() {
-                println!("  issues    unavailable ({})", r.status());
-            } else if let Ok(body) = r.json::<Value>().await {
+        if let Some(line) = section_unavailable_line("issues", &issue_resp) {
+            println!("{line}");
+        } else if let Ok(r) = issue_resp {
+            if let Ok(body) = r.json::<Value>().await {
                 let issues = body["issues"].as_array().cloned().unwrap_or_default();
                 let open: Vec<_> = issues
                     .iter()
@@ -139,6 +138,20 @@ pub async fn run(args: StatusArgs) -> Result<()> {
 
     println!();
     Ok(())
+}
+
+/// The status line for a repo section (PRs / issues) whose gated read returned a
+/// non-2xx: the denial must surface, never render as "no open ..." (INV-8).
+/// Returns `None` for a success (the caller renders the body) or a transport error
+/// (the section degrades silently — R5 — so the multi-section `gl status` never
+/// hard-fails on one denied read).
+fn section_unavailable_line(label: &str, resp: &Result<reqwest::Response>) -> Option<String> {
+    match resp {
+        Ok(r) if !r.status().is_success() => {
+            Some(format!("  {label:<10}unavailable ({})", r.status()))
+        }
+        _ => None,
+    }
 }
 
 /// Render a simple ASCII trust bar: 0.75 → "███░"
@@ -341,5 +354,46 @@ mod tests {
     #[test]
     fn trust_bar_quarter() {
         assert_eq!(trust_bar(0.25), "█░░░");
+    }
+
+    // ── gl status section denial surfacing (#123 / INV-8, R5) ────────────
+
+    async fn get_response(server: &mut mockito::Server, status: usize) -> Result<reqwest::Response> {
+        let _m = server
+            .mock("GET", "/x")
+            .with_status(status)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"pulls":[]}"#)
+            .create_async()
+            .await;
+        NodeClient::new(server.url(), None).get("/x").await
+    }
+
+    #[tokio::test]
+    async fn gated_section_surfaces_unavailable_not_empty() {
+        // A gated 404 on a status section must surface "unavailable", never be
+        // treated as "no open PRs" (INV-8).
+        let mut server = mockito::Server::new_async().await;
+        let resp = get_response(&mut server, 404).await;
+        assert_eq!(
+            section_unavailable_line("PRs", &resp),
+            Some(format!("  {:<10}unavailable (404 Not Found)", "PRs"))
+        );
+    }
+
+    #[tokio::test]
+    async fn success_section_returns_none_for_body_render() {
+        // A 2xx returns None so the caller renders the body as before.
+        let mut server = mockito::Server::new_async().await;
+        let resp = get_response(&mut server, 200).await;
+        assert!(section_unavailable_line("issues", &resp).is_none());
+    }
+
+    #[test]
+    fn transport_error_degrades_silently() {
+        // A transport error (not a status) must NOT surface — the section
+        // degrades silently so gl status never hard-fails on one bad read (R5).
+        let err: Result<reqwest::Response> = Err(anyhow::anyhow!("connection refused"));
+        assert!(section_unavailable_line("PRs", &err).is_none());
     }
 }
