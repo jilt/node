@@ -221,9 +221,13 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
             .create_async()
             .await;
         let result = cmd_list("alice/secret".to_string(), server.url(), None).await;
         assert!(result.is_err(), "cert list must Err on a gated 404");
+        // Prove the gated certs path was actually requested: without this, an
+        // unmatched route (mockito's 501, also non-2xx) would satisfy is_err().
+        _m.assert_async().await;
     }
 }
