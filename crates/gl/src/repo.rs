@@ -354,7 +354,11 @@ async fn cmd_info(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
             .ok()
             .and_then(|v| v["message"].as_str().map(String::from))
             .unwrap_or_else(|| "request failed".to_string());
-        anyhow::bail!("repo info failed ({status}): {msg}");
+        // Sanitize the node-advertised message before it reaches the terminal (INV-6).
+        anyhow::bail!(
+            "repo info failed ({status}): {}",
+            crate::sync::sanitize_node_msg(&msg)
+        );
     }
     let r: Value = resp.json().await.context("parse repo info")?;
 

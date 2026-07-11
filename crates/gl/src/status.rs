@@ -82,7 +82,10 @@ pub async fn run(args: StatusArgs) -> Result<()> {
             .get(&format!("/api/v1/repos/{short_owner}/{repo_name}/pulls"))
             .await;
         if let Ok(r) = pr_resp {
-            if let Ok(body) = r.json::<Value>().await {
+            if !r.status().is_success() {
+                // A gated read must not render as "no open PRs" (INV-8); surface it.
+                println!("  PRs       unavailable ({})", r.status());
+            } else if let Ok(body) = r.json::<Value>().await {
                 let prs = body["pulls"].as_array().cloned().unwrap_or_default();
                 let open: Vec<_> = prs
                     .iter()
@@ -109,7 +112,9 @@ pub async fn run(args: StatusArgs) -> Result<()> {
             .get(&format!("/api/v1/repos/{short_owner}/{repo_name}/issues"))
             .await;
         if let Ok(r) = issue_resp {
-            if let Ok(body) = r.json::<Value>().await {
+            if !r.status().is_success() {
+                println!("  issues    unavailable ({})", r.status());
+            } else if let Ok(body) = r.json::<Value>().await {
                 let issues = body["issues"].as_array().cloned().unwrap_or_default();
                 let open: Vec<_> = issues
                     .iter()
