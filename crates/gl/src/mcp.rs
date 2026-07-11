@@ -829,11 +829,13 @@ async fn call_tool(
         "pr_list" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
+                    .await?,
+                "pull requests",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -841,18 +843,22 @@ async fn call_tool(
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let pr: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
-                .await?
-                .json()
-                .await?;
-            let reviews: Value = client
-                .get(&format!(
-                    "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
-                ))
-                .await?
-                .json()
-                .await?;
+            let pr = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
+                    .await?,
+                "pull request",
+            )
+            .await?;
+            let reviews = crate::http::read_json(
+                client
+                    .get(&format!(
+                        "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
+                    ))
+                    .await?,
+                "reviews",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(
                 &json!({ "pr": pr, "reviews": reviews["reviews"] }),
             )?)
@@ -862,11 +868,13 @@ async fn call_tool(
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
+                    .await?,
+                "diff",
+            )
+            .await?;
             let diff = resp["diff"].as_str().unwrap_or("(empty diff)");
             Ok(diff.to_string())
         }
@@ -937,11 +945,13 @@ async fn call_tool(
         "webhook_list" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
+                    .await?,
+                "webhooks",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1168,11 +1178,13 @@ async fn call_tool(
                 let owner = resolve_owner(&args, &client).await?;
                 (owner, repo.to_string())
             };
-            let resp: Value = client
-                .get_authed(&format!("/api/v1/repos/{owner}/{name}/issues"))
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .get_authed(&format!("/api/v1/repos/{owner}/{name}/issues"))
+                    .await?,
+                "issues",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1928,5 +1940,67 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "repo_tree must Err on 404");
+    }
+
+    #[tokio::test]
+    async fn pr_list_surfaces_denial_not_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/pulls")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "pr_list",
+            json!({"owner": "alice", "repo": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "pr_list must Err on 404");
+    }
+
+    #[tokio::test]
+    async fn webhook_list_surfaces_denial_not_hook_targets() {
+        // Client half of #94: a non-owner hooks read must surface the denial,
+        // never render the webhook target URLs as a result.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/hooks")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "webhook_list",
+            json!({"owner": "alice", "repo": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "webhook_list must Err on 404");
+    }
+
+    #[tokio::test]
+    async fn issue_list_surfaces_denial_not_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/issues")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "issue_list",
+            json!({"repo": "alice/secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "issue_list must Err on 404");
     }
 }

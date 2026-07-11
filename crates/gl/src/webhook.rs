@@ -147,12 +147,13 @@ async fn cmd_list(repo: String, node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
     let owner = resolve_owner(&client).await?;
 
-    let resp: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    let resp = crate::http::read_json(
+        client
+            .get(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
+            .await?,
+        "webhooks",
+    )
+    .await?;
 
     let hooks = resp["webhooks"].as_array().cloned().unwrap_or_default();
     if hooks.is_empty() {

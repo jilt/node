@@ -221,12 +221,7 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
 
     let client = signed_client(&node, dir.as_deref());
     let path = format!("/api/v1/repos/{owner}/{name}/issues");
-    let resp: Value = client
-        .get_authed(&path)
-        .await?
-        .json()
-        .await
-        .context("failed to list issues")?;
+    let resp = crate::http::read_json(client.get_authed(&path).await?, "issues").await?;
 
     let issues = resp["issues"].as_array().cloned().unwrap_or_default();
 
@@ -353,14 +348,15 @@ async fn cmd_issue_comments(
     let (owner, name) = resolve_repo(&repo, &node, dir.as_deref()).await?;
     let client = signed_client(&node, dir.as_deref());
 
-    let resp: Value = client
-        .get_authed(&format!(
-            "/api/v1/repos/{owner}/{name}/issues/{id}/comments"
-        ))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    let resp = crate::http::read_json(
+        client
+            .get_authed(&format!(
+                "/api/v1/repos/{owner}/{name}/issues/{id}/comments"
+            ))
+            .await?,
+        "issue comments",
+    )
+    .await?;
 
     let comments = resp["comments"].as_array().cloned().unwrap_or_default();
     if comments.is_empty() {
