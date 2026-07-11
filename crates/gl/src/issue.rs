@@ -765,4 +765,26 @@ mod tests {
         // unmatched route (mockito's 501, also non-2xx) would satisfy is_err().
         _m.assert_async().await;
     }
+
+    #[tokio::test]
+    async fn resolve_repo_surfaces_denial() {
+        // A slash-free repo with an empty identity dir forces the GET / node-info
+        // fetch. A gated 404 there must Err (surfacing the status), proving the
+        // read_json conversion is load-bearing rather than silently ignored.
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap(); // empty, no identity.pem, forces the GET / branch
+        let _m = server
+            .mock("GET", "/")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"denied"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = resolve_repo("noslash", &server.url(), Some(dir.path()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _m.assert_async().await;
+    }
 }

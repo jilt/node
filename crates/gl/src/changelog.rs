@@ -268,4 +268,31 @@ mod tests {
         let err = rt.block_on(run(args)).unwrap_err();
         assert!(err.to_string().contains("no repo specified"));
     }
+
+    #[tokio::test]
+    async fn resolve_via_run_surfaces_denial() {
+        // A slash-free repo with an empty identity dir forces the inline GET /
+        // node-info fetch during resolution. A gated 404 there must Err (surfacing
+        // the status), proving the read_json conversion is load-bearing.
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap(); // empty, no identity.pem, forces the GET / branch
+        let _m = server
+            .mock("GET", "/")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"denied"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = run(ChangelogArgs {
+            repo: Some("noslash".to_string()),
+            limit: 20,
+            node: server.url(),
+            dir: Some(dir.path().to_path_buf()),
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _m.assert_async().await;
+    }
 }

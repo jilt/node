@@ -2432,4 +2432,39 @@ mod tests {
         )
         .await;
     }
+
+    #[tokio::test]
+    async fn repo_clone_url_via_mcp_surfaces_denial() {
+        // repo_clone_url resolves the node DID via GET / (read_json). A gated 404
+        // there must Err (surfacing the status), not fabricate a clone URL.
+        assert_tool_surfaces_denial(
+            "repo_clone_url",
+            "GET",
+            mockito::Matcher::Regex(r"^/$".to_string()),
+            json!({"name": "r"}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn mcp_resolve_owner_surfaces_denial() {
+        // With no "owner" arg, resolve_owner GETs / for the node DID via read_json.
+        // A gated 404 there must Err (surfacing the status), proving the conversion
+        // is load-bearing rather than silently ignored.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"denied"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = resolve_owner(&json!({}), &NodeClient::new(server.url(), None))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _m.assert_async().await;
+    }
 }

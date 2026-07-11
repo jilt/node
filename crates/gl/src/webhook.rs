@@ -448,4 +448,25 @@ mod tests {
         // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
         _m.assert_async().await;
     }
+
+    #[tokio::test]
+    async fn resolve_owner_surfaces_denial() {
+        // resolve_owner always GETs / for the node DID. A gated 404 there must Err
+        // (surfacing the status), proving the read_json conversion is load-bearing
+        // rather than silently ignored.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"denied"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = resolve_owner(&crate::http::NodeClient::new(server.url(), None))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _m.assert_async().await;
+    }
 }
