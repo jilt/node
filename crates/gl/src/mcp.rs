@@ -687,22 +687,24 @@ async fn call_tool(
         "repo_get" => {
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let repo: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}"))
-                .await?
-                .json()
-                .await?;
+            let repo = crate::http::read_json(
+                client.get(&format!("/api/v1/repos/{owner}/{name}")).await?,
+                "repo",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&repo)?)
         }
 
         "repo_commits" => {
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let commits: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}/commits"))
-                .await?
-                .json()
-                .await?;
+            let commits = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{name}/commits"))
+                    .await?,
+                "commits",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&commits)?)
         }
 
@@ -710,11 +712,13 @@ async fn call_tool(
             let name = args["name"].as_str().context("missing 'name'")?;
             let path = args["path"].as_str().unwrap_or("");
             let owner = resolve_owner(&args, &client).await?;
-            let tree: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}/tree/{path}"))
-                .await?
-                .json()
-                .await?;
+            let tree = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{name}/tree/{path}"))
+                    .await?,
+                "tree",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&tree)?)
         }
 
@@ -1830,5 +1834,99 @@ mod tests {
         let tools = tool_definitions();
         let count = tools.as_array().unwrap().len();
         assert_eq!(count, 40, "expected 40 tools, got {count}");
+    }
+
+    // ── Gated read arms surface node denials, not fabricated results (#123 / INV-8) ──
+
+    #[tokio::test]
+    async fn repo_get_surfaces_denial_not_fabricated_repo() {
+        // The node returns the opaque 404 for a private repo the caller cannot read.
+        // The tool must Err surfacing it, NOT Ok with the error body serialized as the repo.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .create_async()
+            .await;
+
+        let result = call_tool(
+            "repo_get",
+            json!({"owner": "alice", "name": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+
+        let err = result
+            .expect_err("repo_get must Err on a 404, not fabricate a repo")
+            .to_string();
+        assert!(err.contains("404"), "err={err}");
+        assert!(err.contains("not found"), "err={err}");
+    }
+
+    #[tokio::test]
+    async fn repo_get_returns_repo_on_200() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/myrepo")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"name":"myrepo","owner_did":"did:gitlawb:alice"}"#)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "repo_get",
+            json!({"owner": "alice", "name": "myrepo"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["name"], "myrepo");
+    }
+
+    #[tokio::test]
+    async fn repo_commits_surfaces_denial_not_empty_list() {
+        // Before the fix a 404 rendered as "no commits" (empty). Now it must Err.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/commits")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "repo_commits",
+            json!({"owner": "alice", "name": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "repo_commits must Err on 404");
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn repo_tree_surfaces_denial_not_fabricated_tree() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/tree/")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "repo_tree",
+            json!({"owner": "alice", "name": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "repo_tree must Err on 404");
     }
 }

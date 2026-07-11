@@ -130,7 +130,7 @@ async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> String {
 /// reach the terminal verbatim (INV-6). We drop the C0/C1 control bytes (which
 /// defangs ANSI/OSC escapes) AND the Unicode bidi/format controls (which
 /// `char::is_control` does not cover — they can reorder the displayed line).
-fn sanitize_node_msg(s: &str) -> String {
+pub(crate) fn sanitize_node_msg(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_control() && !is_bidi_format(*c))
         .take(200)
