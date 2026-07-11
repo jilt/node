@@ -511,12 +511,7 @@ pub(crate) async fn cmd_commits(
     };
 
     let url = format!("/api/v1/repos/{owner}/{name}/commits?branch={branch}&limit={limit}");
-    let resp: Value = client
-        .get(&url)
-        .await?
-        .json()
-        .await
-        .context("failed to fetch commits")?;
+    let resp = crate::http::read_json(client.get(&url).await?, "commits").await?;
 
     let commits = resp["commits"].as_array().cloned().unwrap_or_default();
     if commits.is_empty() {
@@ -660,12 +655,13 @@ async fn cmd_label_list(repo: String, node: String, dir: Option<PathBuf>) -> Res
     let (owner, name) = resolve_owner_repo_pair(&repo, &node, dir.as_deref()).await?;
     let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
 
-    let resp: Value = client
-        .get_authed(&format!("/api/v1/repos/{owner}/{name}/labels"))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    let resp = crate::http::read_json(
+        client
+            .get_authed(&format!("/api/v1/repos/{owner}/{name}/labels"))
+            .await?,
+        "labels",
+    )
+    .await?;
 
     let labels = resp["labels"].as_array().cloned().unwrap_or_default();
     if labels.is_empty() {
@@ -1291,5 +1287,50 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    // ── Gated CLI reads surface node denials, not empty renders (#123 / INV-8) ──
+
+    #[tokio::test]
+    async fn cmd_commits_surfaces_denial_not_empty() {
+        // A gated 404 must Err, not print "No commits" as if the repo were empty.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/alice/secret/commits".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .create_async()
+            .await;
+        let result = cmd_commits(
+            "alice/secret".to_string(),
+            "main".to_string(),
+            20,
+            server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "cmd_commits must Err on 404");
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn cmd_label_list_surfaces_denial_not_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/alice/secret/labels".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .create_async()
+            .await;
+        let result = cmd_label_list("alice/secret".to_string(), server.url(), None).await;
+        assert!(result.is_err(), "cmd_label_list must Err on 404");
     }
 }
