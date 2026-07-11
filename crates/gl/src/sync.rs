@@ -71,8 +71,9 @@ pub async fn run(args: SyncArgs) -> Result<()> {
         SyncCmd::Status => {
             let client = NodeClient::new(&args.node, None);
             // Just show peer list and node stats for now
-            let stats: serde_json::Value = client.get("/api/v1/stats").await?.json().await?;
-            let peers: serde_json::Value = client.get("/api/v1/peers").await?.json().await?;
+            let stats =
+                crate::http::read_json(client.get("/api/v1/stats").await?, "node stats").await?;
+            let peers = crate::http::read_json(client.get("/api/v1/peers").await?, "peers").await?;
             println!("Node stats:");
             println!("  repos:  {}", stats["repos"].as_i64().unwrap_or(0));
             println!("  agents: {}", stats["agents"].as_i64().unwrap_or(0));
@@ -354,5 +355,72 @@ mod tests {
             trigger_counts(&serde_json::json!({"peers_reached": "x"})),
             (0, 0)
         );
+    }
+
+    #[tokio::test]
+    async fn status_surfaces_stats_denial_not_fake_zeros() {
+        // A node error on /stats must Err, not print "0 repos / 0 agents / 0 pushes".
+        let mut server = mockito::Server::new_async().await;
+        let stats = server
+            .mock("GET", "/api/v1/stats")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"boom"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        // A peers mock so the pre-fix path reaches a clean success rather than a
+        // 501 on an unmocked route; after the fix the /stats denial bails first.
+        let _peers = server
+            .mock("GET", "/api/v1/peers")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"count":0,"peers":[]}"#)
+            .create_async()
+            .await;
+        let args = SyncArgs {
+            cmd: SyncCmd::Status,
+            node: server.url(),
+            dir: None,
+        };
+        let err = run(args).await.unwrap_err();
+        assert!(
+            err.to_string().contains("500"),
+            "expected 500 surfaced, got: {err}"
+        );
+        stats.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn status_surfaces_peers_denial() {
+        // /stats succeeds but /peers denies — the peers read must Err too, not
+        // print "Known peers: 0".
+        let mut server = mockito::Server::new_async().await;
+        let _stats = server
+            .mock("GET", "/api/v1/stats")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"repos":1,"agents":2,"pushes":3}"#)
+            .create_async()
+            .await;
+        let peers = server
+            .mock("GET", "/api/v1/peers")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"boom"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let args = SyncArgs {
+            cmd: SyncCmd::Status,
+            node: server.url(),
+            dir: None,
+        };
+        let err = run(args).await.unwrap_err();
+        assert!(
+            err.to_string().contains("500"),
+            "expected 500 surfaced, got: {err}"
+        );
+        peers.assert_async().await;
     }
 }

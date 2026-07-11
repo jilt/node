@@ -63,12 +63,7 @@ pub async fn run(args: PeerArgs) -> Result<()> {
 
 async fn cmd_list(node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
-    let resp: Value = client
-        .get("/api/v1/peers")
-        .await?
-        .json()
-        .await
-        .context("failed to list peers")?;
+    let resp = crate::http::read_json(client.get("/api/v1/peers").await?, "peers").await?;
 
     let peers = resp["peers"].as_array().cloned().unwrap_or_default();
     let count = resp["count"].as_u64().unwrap_or(peers.len() as u64);
@@ -161,12 +156,7 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
 async fn cmd_ping(did: String, node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
     let path = format!("/api/v1/peers/{did}/ping");
-    let resp: Value = client
-        .get(&path)
-        .await?
-        .json()
-        .await
-        .context("failed to ping peer")?;
+    let resp = crate::http::read_json(client.get(&path).await?, "ping peer").await?;
 
     let url = resp["http_url"].as_str().unwrap_or("?");
     let reachable = resp["reachable"].as_bool().unwrap_or(false);
@@ -186,12 +176,7 @@ async fn cmd_resolve(did: String, node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
     let encoded = urlencoding::encode(&did);
     let path = format!("/api/v1/resolve/{encoded}");
-    let resp: Value = client
-        .get(&path)
-        .await?
-        .json()
-        .await
-        .context("failed to resolve DID")?;
+    let resp = crate::http::read_json(client.get(&path).await?, "resolve DID").await?;
 
     let source = resp["source"].as_str().unwrap_or("not found");
     let http_url = resp["http_url"].as_str().unwrap_or("(none)");
@@ -209,4 +194,67 @@ async fn cmd_resolve(did: String, node: String) -> Result<()> {
         println!("  Note: {err}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cmd_list_surfaces_denial_not_empty() {
+        // A node error must Err, not print "No known peers" as if the list were empty.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/peers")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"boom"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = cmd_list(server.url()).await.unwrap_err();
+        assert!(err.to_string().contains("500"), "got: {err}");
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_ping_surfaces_denial_not_unreachable() {
+        // A node error must Err, not print a fabricated "unreachable" peer.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/peers/peer1/ping")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = cmd_ping("peer1".to_string(), server.url())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_resolve_surfaces_denial_not_notfound() {
+        // A node error must Err, not print "Source: not found" as if resolved-absent.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/resolve/".to_string()),
+            )
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"boom"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = cmd_resolve("peer1".to_string(), server.url())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"), "got: {err}");
+        _m.assert_async().await;
+    }
 }
